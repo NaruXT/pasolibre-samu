@@ -1,13 +1,29 @@
 const DURACION_CICLO_SEGUNDOS = 90;
 const DURACION_VERDE_SEGUNDOS = 45;
 
-/** Offset determinístico en [0, 90) — suma de charCodes del id, mod 90. Nunca aleatorio. */
+/**
+ * Finalizador estilo MurmurHash3 (avalancha de bits) — sin esto, IDs cortos y secuenciales
+ * como "1".."6" (el dataset real del ticket #9) producen offsets casi idénticos con un hash
+ * ingenuo (p. ej. una suma de charCodes), sincronizando los semáforos entre sí y arruinando la
+ * demo de coordinación. Determinístico, cero `Math.random()`.
+ */
+function mezclarBits(h: number): number {
+  h = h >>> 0;
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/** Offset determinístico en [0, 90), derivado del id vía djb2 + finalizador. Nunca aleatorio. */
 function offsetDeSemaforo(semaforoId: string): number {
-  let suma = 0;
+  let hash = 5381;
   for (let i = 0; i < semaforoId.length; i++) {
-    suma += semaforoId.charCodeAt(i);
+    hash = ((hash * 33) ^ semaforoId.charCodeAt(i)) >>> 0;
   }
-  return suma % DURACION_CICLO_SEGUNDOS;
+  return mezclarBits(hash) % DURACION_CICLO_SEGUNDOS;
 }
 
 export interface FaseSemaforo {

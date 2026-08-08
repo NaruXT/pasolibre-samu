@@ -2,12 +2,9 @@
 
 import { useEffect, useRef } from "react";
 import mapboxgl from "mapbox-gl";
-import { faseDeSemaforo } from "@/lib/semaforo/fase";
+import { faseEfectiva } from "@/lib/semaforo/faseEfectiva";
+import type { AccionSemaforo } from "@/lib/tick/decision";
 
-// Coordenada de prueba fija sobre el corredor Javier Prado, sin conexión a la ambulancia ni
-// al agente todavía (ticket #6) — eso llega con la orquestación real en tickets posteriores.
-const SEMAFORO_PRUEBA_ID = "semaforo-prueba-1";
-const SEMAFORO_PRUEBA_COORD: [number, number] = [-77.0186, -12.08445];
 const TICK_MS = 1000;
 const COLOR_VERDE = "#16a34a";
 const COLOR_ROJO = "#dc2626";
@@ -24,23 +21,38 @@ function crearElementoSemaforo(): HTMLDivElement {
 
 interface SemaforoProps {
   map: mapboxgl.Map;
+  semaforoId: string;
+  lng: number;
+  lat: number;
+  /**
+   * Decisiones ya publicadas para este semáforo en el trayecto activo (tickets #8/#9) — fuerzan
+   * verde vía `faseEfectiva`, igual que en el servidor. Vacío/omitido = solo ciclo físico
+   * (ticket #6): el semáforo late su fase incluso sin trayecto activo.
+   */
+  accionesPrevias?: readonly AccionSemaforo[];
 }
 
-/** Renderiza un único semáforo hardcodeado cuya fase se recalcula cada segundo desde `faseDeSemaforo`. */
-export function Semaforo({ map }: SemaforoProps) {
+/** Renderiza un semáforo cuya fase efectiva (ciclo físico + decisiones ya publicadas) se recalcula cada segundo. */
+export function Semaforo({ map, semaforoId, lng, lat, accionesPrevias = [] }: SemaforoProps) {
   const markerRef = useRef<mapboxgl.Marker | null>(null);
+  // Ref para que el intervalo (creado una sola vez, ver abajo) siempre lea las acciones más
+  // recientes sin tener que recrear el marker cada vez que el padre publica una decisión nueva.
+  const accionesPreviasRef = useRef(accionesPrevias);
+  useEffect(() => {
+    accionesPreviasRef.current = accionesPrevias;
+  }, [accionesPrevias]);
 
   useEffect(() => {
     const elemento = crearElementoSemaforo();
-    const marker = new mapboxgl.Marker({ element: elemento })
-      .setLngLat(SEMAFORO_PRUEBA_COORD)
-      .addTo(map);
+    const marker = new mapboxgl.Marker({ element: elemento }).setLngLat([lng, lat]).addTo(map);
     markerRef.current = marker;
 
-    const inicio = Date.now();
     const actualizarFase = () => {
-      const tiempoTranscurrido = (Date.now() - inicio) / 1000;
-      const { fase } = faseDeSemaforo(SEMAFORO_PRUEBA_ID, tiempoTranscurrido);
+      // Referenciado al reloj de pared (no al momento de montaje) para que coincida con
+      // `ahoraSegundos` del lado del servidor (Date.now()/1000, ver orquestar.ts) — si no,
+      // el ciclo físico que ve el usuario y el que razona el agente quedarían desfasados.
+      const tiempoTranscurrido = Date.now() / 1000;
+      const { fase } = faseEfectiva(semaforoId, tiempoTranscurrido, accionesPreviasRef.current);
       elemento.style.backgroundColor = fase === "verde" ? COLOR_VERDE : COLOR_ROJO;
     };
     actualizarFase();
@@ -51,7 +63,7 @@ export function Semaforo({ map }: SemaforoProps) {
       marker.remove();
       markerRef.current = null;
     };
-  }, [map]);
+  }, [map, semaforoId, lng, lat]);
 
   return null;
 }

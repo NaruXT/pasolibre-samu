@@ -9,7 +9,11 @@ import { ambulancePositionAt, type AmbulancePosition } from "@/lib/mapbox/ambula
 import { portalClient } from "@/lib/portal/client";
 import { PORTAL_AMBULANCE_CHANNEL_ID, PORTAL_ROUTE_CHANNEL_ID } from "@/lib/portal/constants";
 import type { AmbulancePositionPayload, RoutePublishPayload } from "@/lib/portal/messages";
-import { Semaforo } from "@/components/Semaforo";
+import { SemaforosCorredor } from "@/components/SemaforosCorredor";
+import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBorjaYColindantes";
+import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
+import type { AccionSemaforo } from "@/lib/tick/decision";
+import type { ResultadoSemaforo } from "@/lib/tick/orquestar";
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
@@ -53,7 +57,16 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
   const abortControllerRef = useRef<AbortController | null>(null);
   const ambulanceMarkerRef = useRef<mapboxgl.Marker | null>(null);
   const ambulanceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const semaforosDeLaRutaRef = useRef<SemaforoEnRuta[]>([]);
   const [loadedMap, setLoadedMap] = useState<mapboxgl.Map | null>(null);
+  // El dataset fijo (ticket #9) tiene cientos de semáforos reales en 7 distritos — mostrarlos
+  // todos a la vez (invariante original del ticket #6, pensada para 1 semáforo de prueba) satura
+  // el mapa y el navegador (~1000 markers + ~1000 setInterval). Por eso solo se renderiza la
+  // lista ya filtrada por trayecto (`semaforosEnRuta`), no el dataset crudo completo.
+  const [semaforosVisibles, setSemaforosVisibles] = useState<SemaforoEnRuta[]>([]);
+  const [accionesPreviasPorSemaforo, setAccionesPreviasPorSemaforo] = useState<
+    Record<string, AccionSemaforo[]>
+  >({});
 
   useEffect(() => {
     if (!containerRef.current || !MAPBOX_TOKEN) return;
@@ -84,6 +97,46 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       });
     };
 
+    // El seam de orquestación (ticket #7/#8) vive en /api/tick — este es el único punto donde
+    // el cliente lo invoca. Por cada semáforo del corredor filtrado (ticket #9), el servidor
+    // calcula ETA/fase y decide (LLM real) si entra en la ventana de decisión; acá solo
+    // acumulamos las decisiones ya publicadas para que `SemaforosCorredor` fuerce verde en la UI
+    // igual que `faseEfectiva` lo hace del lado del servidor.
+    const ejecutarTickOrquestacion = async (
+      position: AmbulancePosition,
+      velocidadMetrosPorSegundo: number
+    ) => {
+      const semaforosPendientes = semaforosDeLaRutaRef.current;
+      if (semaforosPendientes.length === 0) return;
+
+      try {
+        const response = await fetch("/api/tick", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            posicionAmbulancia: { lng: position.lng, lat: position.lat, velocidadMetrosPorSegundo },
+            semaforosPendientes,
+          }),
+        });
+        if (!response.ok) throw new Error(`Tick de orquestación falló (${response.status}).`);
+
+        const { resultados }: { resultados: ResultadoSemaforo[] } = await response.json();
+        if (resultados.every((resultado) => resultado.decision === null)) return;
+
+        setAccionesPreviasPorSemaforo((previo) => {
+          const siguiente = { ...previo };
+          for (const resultado of resultados) {
+            if (!resultado.decision) continue;
+            const previas = siguiente[resultado.semaforoId] ?? [];
+            siguiente[resultado.semaforoId] = [...previas, resultado.decision.accion];
+          }
+          return siguiente;
+        });
+      } catch (error) {
+        console.error("No se pudo ejecutar el tick de orquestación:", error);
+      }
+    };
+
     const clearAmbulanceTimer = () => {
       if (ambulanceTimerRef.current !== null) {
         clearInterval(ambulanceTimerRef.current);
@@ -101,6 +154,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
     // prioridad y nunca se ralentiza por tráfico, a diferencia del ETA que ve el usuario.
     const startAmbulance = (route: DrivingRoute) => {
       stopAmbulance();
+      const velocidadMetrosPorSegundo = route.distanceMeters / route.durationSeconds;
 
       let elapsedSeconds = 0;
       const initialPosition = ambulancePositionAt(route, elapsedSeconds);
@@ -109,6 +163,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
         .addTo(map);
       ambulanceMarkerRef.current = marker;
       publishAmbulancePosition(initialPosition);
+      void ejecutarTickOrquestacion(initialPosition, velocidadMetrosPorSegundo);
 
       if (initialPosition.arrived) return; // origin === destination, nada que animar
 
@@ -117,6 +172,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
         const position = ambulancePositionAt(route, elapsedSeconds);
         marker.setLngLat([position.lng, position.lat]);
         publishAmbulancePosition(position);
+        void ejecutarTickOrquestacion(position, velocidadMetrosPorSegundo);
         if (position.arrived) clearAmbulanceTimer();
       }, AMBULANCE_TICK_MS);
     };
@@ -173,6 +229,17 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
           routeSource()?.setData(toRouteFeature(displayRoute.geometry));
           onRouteStateChange({ status: "ready", route: displayRoute });
 
+          // Nuevo trayecto: recorta el corredor fijo (ticket #9) a los semáforos dentro del
+          // buffer de esta ruta, y olvida las decisiones del trayecto anterior — son de otro
+          // recorrido, no de este.
+          const semaforosDeLaRuta = semaforosEnRuta(
+            SEMAFOROS_SAN_BORJA_Y_COLINDANTES,
+            ambulanceRoute.geometry
+          );
+          semaforosDeLaRutaRef.current = semaforosDeLaRuta;
+          setSemaforosVisibles(semaforosDeLaRuta);
+          setAccionesPreviasPorSemaforo({});
+
           // ruta-ambulancia-1 lleva la ruta propia de la ambulancia (no la ruta de tráfico que
           // se muestra) para que la línea de un suscriptor coincida exactamente con las
           // actualizaciones de posición en ambulancia-1.
@@ -225,7 +292,13 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
   return (
     <>
       <div ref={containerRef} className="h-full w-full" />
-      {loadedMap && <Semaforo map={loadedMap} />}
+      {loadedMap && (
+        <SemaforosCorredor
+          map={loadedMap}
+          semaforos={semaforosVisibles}
+          accionesPreviasPorSemaforo={accionesPreviasPorSemaforo}
+        />
+      )}
     </>
   );
 }
