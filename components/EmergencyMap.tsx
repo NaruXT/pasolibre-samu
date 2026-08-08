@@ -5,7 +5,10 @@ import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { Feature, LineString } from "geojson";
 import { fetchDrivingRoute, type DrivingRoute, type RouteState } from "@/lib/mapbox/directions";
-import { ambulancePositionAt } from "@/lib/mapbox/ambulance";
+import { ambulancePositionAt, type AmbulancePosition } from "@/lib/mapbox/ambulance";
+import { portalClient } from "@/lib/portal/client";
+import { PORTAL_AMBULANCE_CHANNEL_ID, PORTAL_ROUTE_CHANNEL_ID } from "@/lib/portal/constants";
+import type { AmbulancePositionPayload, RoutePublishPayload } from "@/lib/portal/messages";
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
@@ -66,6 +69,19 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
+    const routeChannel = portalClient.channel<RoutePublishPayload>(PORTAL_ROUTE_CHANNEL_ID);
+    const ambulanceChannel = portalClient.channel<AmbulancePositionPayload>(
+      PORTAL_AMBULANCE_CHANNEL_ID
+    );
+    routeChannel.acquire();
+    ambulanceChannel.acquire();
+
+    const publishAmbulancePosition = (position: AmbulancePosition) => {
+      ambulanceChannel.send({ content: position, ephemeral: true }).catch((error) => {
+        console.error("No se pudo publicar la posición de la ambulancia en Portal:", error);
+      });
+    };
+
     const clearAmbulanceTimer = () => {
       if (ambulanceTimerRef.current !== null) {
         clearInterval(ambulanceTimerRef.current);
@@ -90,6 +106,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
         .setLngLat([initialPosition.lng, initialPosition.lat])
         .addTo(map);
       ambulanceMarkerRef.current = marker;
+      publishAmbulancePosition(initialPosition);
 
       if (initialPosition.arrived) return; // origin === destination, nothing to animate
 
@@ -97,6 +114,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
         elapsedSeconds += AMBULANCE_TICK_SECONDS;
         const position = ambulancePositionAt(route, elapsedSeconds);
         marker.setLngLat([position.lng, position.lat]);
+        publishAmbulancePosition(position);
         if (position.arrived) clearAmbulanceTimer();
       }, AMBULANCE_TICK_MS);
     };
@@ -148,6 +166,23 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
 
           routeSource()?.setData(toRouteFeature(displayRoute.geometry));
           onRouteStateChange({ status: "ready", route: displayRoute });
+
+          // ruta-ambulancia-1 carries the ambulance's own route (not the traffic-aware display
+          // route) so a subscriber's line matches the position updates on ambulancia-1 exactly.
+          routeChannel
+            .send({
+              content: {
+                geometry: ambulanceRoute.geometry,
+                distanceMeters: ambulanceRoute.distanceMeters,
+                durationSeconds: ambulanceRoute.durationSeconds,
+                origin,
+                destination,
+              },
+            })
+            .catch((error) => {
+              console.error("No se pudo publicar la ruta en Portal:", error);
+            });
+
           startAmbulance(ambulanceRoute);
         } catch (error) {
           if (requestId !== requestIdRef.current) return;
@@ -166,6 +201,8 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       stopAmbulance();
       markerRef.current?.remove();
       map.remove();
+      routeChannel.release();
+      ambulanceChannel.release();
     };
   }, [onEmergencyPointChange, onRouteStateChange]);
 
