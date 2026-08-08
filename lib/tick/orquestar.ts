@@ -1,5 +1,6 @@
 import { calcularETASegundos, type LngLat } from "./eta";
-import { decidirAccionMock, type AccionSemaforo, type DecisionSemaforo } from "./decision";
+import type { AccionSemaforo, DecisionSemaforo } from "./decision";
+import type { ContextoDecisionSemaforo } from "./agent";
 import { faseEfectiva } from "@/lib/semaforo/faseEfectiva";
 import type { FaseSemaforo } from "@/lib/semaforo/fase";
 
@@ -27,9 +28,11 @@ export interface ResultadoSemaforo {
 }
 
 export interface OrquestarTickDeps {
-  /** Fronteras de I/O real — en producción hablan con Portal, en tests son dobles en memoria. */
+  /** Fronteras de I/O real — en producción hablan con Portal/el LLM, en tests son dobles en memoria. */
   obtenerAccionesPrevias: (semaforoId: string) => Promise<AccionSemaforo[]>;
   publicarDecision: (decision: DecisionSemaforo) => Promise<void>;
+  /** Agente de decisión (LLM real en producción, ticket #8) — inyectado para no gastar cuota en tests. */
+  decidirAccion: (contexto: ContextoDecisionSemaforo) => Promise<DecisionSemaforo>;
   /** Inyectable para tests determinísticos; por default el reloj real. */
   ahoraSegundos?: () => number;
 }
@@ -37,8 +40,8 @@ export interface OrquestarTickDeps {
 /**
  * El seam principal del proyecto: por cada semáforo pendiente calcula ETA y fase (funciones
  * puras, se ejecutan de verdad), y si el ETA entra en la ventana de decisión y el semáforo
- * todavía no tiene ninguna decisión publicada, invoca al agente (mock, ticket #7) una sola
- * vez y publica su decisión.
+ * todavía no tiene ninguna decisión publicada, invoca al agente (LLM real, ticket #8; `deps`
+ * lo inyecta para no gastar cuota en tests) una sola vez y publica su decisión.
  *
  * "Todavía no tiene decisión" se resuelve consultando semaforos-ruta-1 solo por `semaforoId`
  * (ver `deps.obtenerAccionesPrevias`) — no existe un `tripId`/`trayectoId` en ningún payload
@@ -65,7 +68,12 @@ export async function orquestarTick(
 
     let decision: DecisionSemaforo | null = null;
     if (etaSegundos <= VENTANA_DECISION_SEGUNDOS && !yaTieneDecision) {
-      decision = decidirAccionMock(semaforo.semaforoId);
+      const faseAntesDeDecidir = faseEfectiva(semaforo.semaforoId, ahora, accionesPrevias);
+      decision = await deps.decidirAccion({
+        semaforoId: semaforo.semaforoId,
+        etaSegundos,
+        fase: faseAntesDeDecidir,
+      });
       await deps.publicarDecision(decision);
       accionesPrevias.push(decision.accion);
     }

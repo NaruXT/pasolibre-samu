@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { orquestarTick, type OrquestarTickInput } from "@/lib/tick/orquestar";
+import { decidirAccionLLM } from "@/lib/tick/agent";
 import { publishToPortalChannel } from "@/lib/portal/server";
 import { obtenerAccionesPreviasSemaforo } from "@/lib/portal/serverReader";
 import { PORTAL_SEMAFOROS_CHANNEL_ID } from "@/lib/portal/constants";
@@ -23,6 +24,7 @@ export async function POST(request: Request) {
   try {
     const resultados = await orquestarTick(input, {
       obtenerAccionesPrevias: obtenerAccionesPreviasSemaforo,
+      decidirAccion: decidirAccionLLM,
       publicarDecision: async (decision: DecisionSemaforo) => {
         await publishToPortalChannel({
           channelId: PORTAL_SEMAFOROS_CHANNEL_ID,
