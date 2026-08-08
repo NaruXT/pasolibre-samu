@@ -11,3 +11,6 @@ export const PORTAL_ROUTE_CHANNEL_ID = "ruta-ambulancia-1";
 
 /** Cliente, ephemeral: true, WebSocket — posición en vivo de la ambulancia, un envío por tick. */
 export const PORTAL_AMBULANCE_CHANNEL_ID = "ambulancia-1";
+
+/** Servidor, REST, no ephemeral — decisiones del agente (mock en el ticket #7) por semáforo. */
+export const PORTAL_SEMAFOROS_CHANNEL_ID = "semaforos-ruta-1";
