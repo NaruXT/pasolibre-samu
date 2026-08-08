@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { Feature, LineString } from "geojson";
@@ -9,6 +9,7 @@ import { ambulancePositionAt, type AmbulancePosition } from "@/lib/mapbox/ambula
 import { portalClient } from "@/lib/portal/client";
 import { PORTAL_AMBULANCE_CHANNEL_ID, PORTAL_ROUTE_CHANNEL_ID } from "@/lib/portal/constants";
 import type { AmbulancePositionPayload, RoutePublishPayload } from "@/lib/portal/messages";
+import { Semaforo } from "@/components/Semaforo";
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
@@ -52,6 +53,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
   const abortControllerRef = useRef<AbortController | null>(null);
   const ambulanceMarkerRef = useRef<mapboxgl.Marker | null>(null);
   const ambulanceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [loadedMap, setLoadedMap] = useState<mapboxgl.Map | null>(null);
 
   useEffect(() => {
     if (!containerRef.current || !MAPBOX_TOKEN) return;
@@ -135,6 +137,8 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
         paint: { "line-color": "#2563eb", "line-width": 5, "line-opacity": 0.85 },
       });
 
+      setLoadedMap(map);
+
       map.on("click", async (event) => {
         const { lng, lat } = event.lngLat;
 
@@ -206,6 +210,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       map.remove();
       routeChannel.release();
       ambulanceChannel.release();
+      setLoadedMap(null);
     };
   }, [onEmergencyPointChange, onRouteStateChange]);
 
@@ -217,5 +222,10 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
     );
   }
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  return (
+    <>
+      <div ref={containerRef} className="h-full w-full" />
+      {loadedMap && <Semaforo map={loadedMap} />}
+    </>
+  );
 }
