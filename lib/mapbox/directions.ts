@@ -29,9 +29,17 @@ interface MapboxDirectionsResponse {
   }[];
 }
 
+/**
+ * "driving-traffic" for the user-facing ETA preview; "driving" (no traffic) for anything
+ * deriving the ambulance's own pace — CLAUDE.md's invariant is the ambulance is never slowed
+ * by traffic. Required (not defaulted) so every call site has to make this choice on purpose.
+ */
+export type DrivingProfile = "driving" | "driving-traffic";
+
 export async function fetchDrivingRoute(
   origin: LngLat,
   destination: LngLat,
+  profile: DrivingProfile,
   options?: { signal?: AbortSignal }
 ): Promise<DrivingRoute> {
   if (!MAPBOX_TOKEN) {
@@ -39,12 +47,7 @@ export async function fetchDrivingRoute(
   }
 
   const coordinates = `${origin.lng},${origin.lat};${destination.lng},${destination.lat}`;
-  // driving-traffic: fine for this user-facing ETA preview. Do NOT reuse this profile for the
-  // ambulance's own movement (ticket #4+) — CLAUDE.md's invariant is the ambulance moves at
-  // Mapbox's plain route-leg pace, never slowed by traffic.
-  const url = new URL(
-    `https://api.mapbox.com/directions/v5/mapbox/driving-traffic/${coordinates}`
-  );
+  const url = new URL(`https://api.mapbox.com/directions/v5/mapbox/${profile}/${coordinates}`);
   url.searchParams.set("geometries", "geojson");
   url.searchParams.set("overview", "full");
   url.searchParams.set("alternatives", "false");
