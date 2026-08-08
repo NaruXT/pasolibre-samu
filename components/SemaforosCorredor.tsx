@@ -3,7 +3,7 @@
 import type mapboxgl from "mapbox-gl";
 import { Semaforo } from "@/components/Semaforo";
 import type { SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
-import type { AccionSemaforo } from "@/lib/tick/decision";
+import type { DecisionSemaforo } from "@/lib/tick/decision";
 
 interface SemaforosCorredorProps {
   map: mapboxgl.Map;
@@ -16,15 +16,15 @@ interface SemaforosCorredorProps {
    * aplicar a la lista filtrada: sin trayecto, esta lista está vacía y no se renderiza nada.
    */
   semaforos: readonly SemaforoEnRuta[];
-  /** Decisiones ya conocidas por semaforoId (ticket #9) — ver `Semaforo`. */
-  accionesPreviasPorSemaforo?: Readonly<Record<string, readonly AccionSemaforo[]>>;
+  /** Decisión ya publicada por semaforoId (tickets #9/#11) — ver `Semaforo`. */
+  decisionesPorSemaforo?: Readonly<Record<string, DecisionSemaforo>>;
 }
 
 /** Renderiza los semáforos del trayecto activo, cada uno latiendo su fase efectiva (ciclo físico + decisiones ya publicadas). */
 export function SemaforosCorredor({
   map,
   semaforos,
-  accionesPreviasPorSemaforo = {},
+  decisionesPorSemaforo = {},
 }: SemaforosCorredorProps) {
   return (
     <>
@@ -35,7 +35,7 @@ export function SemaforosCorredor({
           semaforoId={semaforo.semaforoId}
           lng={semaforo.lng}
           lat={semaforo.lat}
-          accionesPrevias={accionesPreviasPorSemaforo[semaforo.semaforoId]}
+          decision={decisionesPorSemaforo[semaforo.semaforoId]}
         />
       ))}
     </>
