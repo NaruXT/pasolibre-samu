@@ -5,6 +5,7 @@ import { publishToPortalChannel } from "@/lib/portal/server";
 import { obtenerAccionesPreviasSemaforo } from "@/lib/portal/serverReader";
 import { PORTAL_SEMAFOROS_CHANNEL_ID } from "@/lib/portal/constants";
 import type { DecisionSemaforo } from "@/lib/tick/decision";
+import { obtenerCongestionTransversal } from "@/lib/tomtom/trafficFlow";
 
 export async function POST(request: Request) {
   let input: OrquestarTickInput;
@@ -25,6 +26,7 @@ export async function POST(request: Request) {
     const resultados = await orquestarTick(input, {
       obtenerAccionesPrevias: obtenerAccionesPreviasSemaforo,
       decidirAccion: decidirAccionLLM,
+      obtenerCongestionTransversal,
       publicarDecision: async (decision: DecisionSemaforo) => {
         await publishToPortalChannel({
           channelId: PORTAL_SEMAFOROS_CHANNEL_ID,

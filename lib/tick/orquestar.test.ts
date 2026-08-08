@@ -15,6 +15,7 @@ function crearDepsFake(accionesPreviasPorSemaforo: Record<string, AccionSemaforo
       decisionesPublicadas.push(decision);
     },
     decidirAccion: async (contexto) => ({ semaforoId: contexto.semaforoId, ...DECISION_FAKE }),
+    obtenerCongestionTransversal: async () => null,
     ahoraSegundos: () => 45, // fijo, para que la fase física sea determinística en los tests
   };
   return { deps, decisionesPublicadas };
@@ -116,5 +117,67 @@ describe("orquestarTick", () => {
     expect(["rojo", "verde"]).toContain(contexto.fase.fase);
     expect(typeof contexto.fase.segundosRestantes).toBe("number");
     expect(decisionesPublicadas).toHaveLength(1);
+  });
+
+  test("el agente recibe la congestión transversal de TomTom en el contexto (ticket #10)", async () => {
+    const { deps } = crearDepsFake();
+    deps.obtenerCongestionTransversal = async () => ({
+      currentSpeedKmph: 15,
+      freeFlowSpeedKmph: 50,
+      nivel: "congestionado",
+    });
+    let contextoRecibido: { congestionTransversal?: unknown } | undefined;
+    deps.decidirAccion = async (contexto) => {
+      contextoRecibido = contexto;
+      return { semaforoId: contexto.semaforoId, ...DECISION_FAKE };
+    };
+
+    await orquestarTick(
+      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      deps
+    );
+
+    expect(contextoRecibido?.congestionTransversal).toEqual({
+      currentSpeedKmph: 15,
+      freeFlowSpeedKmph: 50,
+      nivel: "congestionado",
+    });
+  });
+
+  test("TomTom solo se consulta cuando el semáforo entra en ventana de decisión (ticket #10)", async () => {
+    const { deps } = crearDepsFake();
+    let llamadas = 0;
+    deps.obtenerCongestionTransversal = async () => {
+      llamadas++;
+      return null;
+    };
+
+    await orquestarTick(
+      { posicionAmbulancia: AMBULANCIA_LEJOS, semaforosPendientes: [SEMAFORO_LEJOS] },
+      deps
+    );
+    expect(llamadas).toBe(0);
+
+    await orquestarTick(
+      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      deps
+    );
+    expect(llamadas).toBe(1);
+  });
+
+  test("TomTom no se re-consulta si el semáforo ya tiene decisión publicada (ticket #10)", async () => {
+    const { deps } = crearDepsFake({ "sem-cerca": ["mantener_ciclo"] });
+    let llamadas = 0;
+    deps.obtenerCongestionTransversal = async () => {
+      llamadas++;
+      return null;
+    };
+
+    await orquestarTick(
+      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      deps
+    );
+
+    expect(llamadas).toBe(0);
   });
 });
