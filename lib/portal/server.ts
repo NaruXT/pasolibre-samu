@@ -8,9 +8,10 @@ interface PublishToPortalChannelInput {
   content: unknown;
   type?: string;
   /**
-   * Required by the server REST publish endpoint: unlike the client SDK (which derives the
-   * sender from the connection's auth token), a secret-key request has no session identity,
-   * so the caller must name one. Not documented publicly — found via a live smoke test.
+   * Requerido por el endpoint REST de publicación del servidor: a diferencia del SDK cliente
+   * (que deriva el sender del token de auth de la conexión), una request con secret key no
+   * tiene identidad de sesión, así que quien llama debe nombrar una. No documentado
+   * públicamente — encontrado mediante una prueba en vivo.
    */
   senderId: string;
 }

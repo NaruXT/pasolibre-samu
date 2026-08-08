@@ -9,9 +9,9 @@ export interface AmbulancePosition {
 }
 
 /**
- * Position of a priority-vehicle ambulance along `route` after `elapsedSeconds` of travel,
- * assuming constant speed over Mapbox's estimated duration for the whole leg (the ambulance
- * is never slowed by traffic — see CLAUDE.md).
+ * Posición de una ambulancia con prioridad sobre `route` tras `elapsedSeconds` de viaje,
+ * asumiendo velocidad constante sobre la duración estimada por Mapbox para todo el tramo
+ * (la ambulancia nunca se ralentiza por tráfico — ver CLAUDE.md).
  */
 export function ambulancePositionAt(
   route: { geometry: LineString; durationSeconds: number },

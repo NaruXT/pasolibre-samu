@@ -2,7 +2,7 @@ import type { LineString } from "geojson";
 import type { LngLat } from "@/lib/mapbox/directions";
 import type { AmbulancePosition } from "@/lib/mapbox/ambulance";
 
-/** Published once per trip to PORTAL_ROUTE_CHANNEL_ID. */
+/** Publicado una sola vez por trayecto a PORTAL_ROUTE_CHANNEL_ID. */
 export interface RoutePublishPayload {
   geometry: LineString;
   distanceMeters: number;
@@ -11,5 +11,5 @@ export interface RoutePublishPayload {
   destination: LngLat;
 }
 
-/** Published ephemeral on every ambulance tick to PORTAL_AMBULANCE_CHANNEL_ID. */
+/** Publicado como ephemeral en cada tick de la ambulancia a PORTAL_AMBULANCE_CHANNEL_ID. */
 export type AmbulancePositionPayload = AmbulancePosition;

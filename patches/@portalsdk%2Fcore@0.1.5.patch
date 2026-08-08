@@ -1,0 +1,84 @@
+diff --git a/node_modules/@portalsdk/core/.bun-tag-1c089eab0cfdbc02 b/.bun-tag-1c089eab0cfdbc02
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@portalsdk/core/.bun-tag-d4d4483a43a731a7 b/.bun-tag-d4d4483a43a731a7
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/index.cjs b/dist/index.cjs
+index 2eb4d9056160e70018185dc543a1d2e614a6e70e..55cfcb9c776a8d539fbc605f8695d97e62ea0670 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -845,6 +845,34 @@ var ChannelConnection = class {
+   #onMessage(raw) {
+     const frame = wireProtocol.parseChannelFrame(raw);
+     if (frame === null) return;
++    if (frame.t === "ephemeral" && typeof frame.userId === "string") {
++      // PATCH (pasoLibre-SAMU, see patches/@portalsdk%2Fcore@0.1.5.patch): the server relays a
++      // client's ephemeral send to other subscribers as its own {t:"ephemeral", userId, type,
++      // content} frame — not wrapped in a "batch"/"direct" WireMessage[] like every other
++      // message path. @portalsdk/wire-protocol never modeled this shape (no case in its frame
++      // validator, confirmed against github.com/useportal/portal-sdk main HEAD), so
++      // parseChannelFrame classifies it as an UnknownFrame and every isXxx(frame) guard below
++      // (rightly) rejects it — the frame is silently swallowed before #deliver/ingest ever run.
++      // Verified via raw WebSocket frame capture: this frame genuinely arrives over the wire,
++      // it's just never dispatched. No `id`/`timestamp` on the wire for this frame type, so
++      // they're synthesized client-side; `anon` is inferred from the "anon_" id prefix used
++      // consistently elsewhere in this SDK, since the frame carries no explicit anon flag.
++      const msg = {
++        id: `ephemeral_${Date.now()}_${Math.random().toString(36).slice(2)}`,
++        channelId: this.#deps.channelId,
++        type: typeof frame.type === "string" ? frame.type : "message",
++        kind: "text",
++        content: frame.content,
++        sender: { id: frame.userId, anon: frame.userId.startsWith("anon_") },
++        timestamp: Date.now(),
++        retracted: false,
++        ephemeral: true,
++        unread: false,
++        status: "sent"
++      };
++      this.events.emit("message", msg);
++      return;
++    }
+     if (wireProtocol.isChannelReady(frame)) return this.#onReady(frame);
+     if (wireProtocol.isBatch(frame)) return this.#deliver(frame.msgs);
+     if (wireProtocol.isDirect(frame)) return this.#deliver([frame.msg]);
+diff --git a/dist/index.js b/dist/index.js
+index 5ff4705045d7a10a3de29645c4705cf93b9170de..a76ca8539bbe35d3b3f1606c7f9bd5f5ee235e8f 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -843,6 +843,34 @@ var ChannelConnection = class {
+   #onMessage(raw) {
+     const frame = parseChannelFrame(raw);
+     if (frame === null) return;
++    if (frame.t === "ephemeral" && typeof frame.userId === "string") {
++      // PATCH (pasoLibre-SAMU, see patches/@portalsdk%2Fcore@0.1.5.patch): the server relays a
++      // client's ephemeral send to other subscribers as its own {t:"ephemeral", userId, type,
++      // content} frame — not wrapped in a "batch"/"direct" WireMessage[] like every other
++      // message path. @portalsdk/wire-protocol never modeled this shape (no case in its frame
++      // validator, confirmed against github.com/useportal/portal-sdk main HEAD), so
++      // parseChannelFrame classifies it as an UnknownFrame and every isXxx(frame) guard below
++      // (rightly) rejects it — the frame is silently swallowed before #deliver/ingest ever run.
++      // Verified via raw WebSocket frame capture: this frame genuinely arrives over the wire,
++      // it's just never dispatched. No `id`/`timestamp` on the wire for this frame type, so
++      // they're synthesized client-side; `anon` is inferred from the "anon_" id prefix used
++      // consistently elsewhere in this SDK, since the frame carries no explicit anon flag.
++      const msg = {
++        id: `ephemeral_${Date.now()}_${Math.random().toString(36).slice(2)}`,
++        channelId: this.#deps.channelId,
++        type: typeof frame.type === "string" ? frame.type : "message",
++        kind: "text",
++        content: frame.content,
++        sender: { id: frame.userId, anon: frame.userId.startsWith("anon_") },
++        timestamp: Date.now(),
++        retracted: false,
++        ephemeral: true,
++        unread: false,
++        status: "sent"
++      };
++      this.events.emit("message", msg);
++      return;
++    }
+     if (isChannelReady(frame)) return this.#onReady(frame);
+     if (isBatch(frame)) return this.#deliver(frame.msgs);
+     if (isDirect(frame)) return this.#deliver([frame.msg]);

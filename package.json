@@ -37,5 +37,8 @@
   "trustedDependencies": [
     "sharp",
     "unrs-resolver"
-  ]
+  ],
+  "patchedDependencies": {
+    "@portalsdk/core@0.1.5": "patches/@portalsdk%2Fcore@0.1.5.patch"
+  }
 }

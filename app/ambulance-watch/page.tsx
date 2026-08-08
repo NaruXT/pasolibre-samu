@@ -13,10 +13,8 @@ export default function AmbulanceWatchPage() {
     channelId: PORTAL_ROUTE_CHANNEL_ID,
   });
 
-  // onMessage is the documented way to observe ephemeral sends (they never land in `messages`,
-  // which is seq-ordered). In practice this count will likely stay at 0: @portalsdk/core@0.1.5
-  // drops incoming ephemeral messages in its own ingest() before any listener runs — a known
-  // upstream bug, not a bug here. See CLAUDE.md's Intent Layer for the source-level citation.
+  // onMessage es la forma documentada de observar envíos ephemeral (nunca llegan a `messages`,
+  // que está ordenado por seq). Requiere el parche local a @portalsdk/core — ver CLAUDE.md.
   const { status: ambulanceStatus } = useChannel<AmbulancePositionPayload>({
     channelId: PORTAL_AMBULANCE_CHANNEL_ID,
     onMessage: (msg) => {
@@ -57,10 +55,7 @@ export default function AmbulanceWatchPage() {
             {latestPosition.arrived ? " · llegó al hospital" : ""}
           </p>
         ) : (
-          <p className="text-sm text-zinc-500">
-            Sin posición todavía. Puede que nunca llegue: bug conocido en @portalsdk/core@0.1.5
-            que descarta mensajes ephemeral al recibirlos (ver CLAUDE.md).
-          </p>
+          <p className="text-sm text-zinc-500">Sin posición todavía.</p>
         )}
       </section>
     </main>

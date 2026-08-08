@@ -95,8 +95,8 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       ambulanceMarkerRef.current = null;
     };
 
-    // `route` must come from the plain "driving" profile — the ambulance is a priority vehicle
-    // and is never slowed by traffic, unlike the traffic-aware ETA shown to the user.
+    // `route` debe venir del perfil "driving" plano — la ambulancia es un vehículo con
+    // prioridad y nunca se ralentiza por tráfico, a diferencia del ETA que ve el usuario.
     const startAmbulance = (route: DrivingRoute) => {
       stopAmbulance();
 
@@ -108,7 +108,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       ambulanceMarkerRef.current = marker;
       publishAmbulancePosition(initialPosition);
 
-      if (initialPosition.arrived) return; // origin === destination, nothing to animate
+      if (initialPosition.arrived) return; // origin === destination, nada que animar
 
       ambulanceTimerRef.current = setInterval(() => {
         elapsedSeconds += AMBULANCE_TICK_SECONDS;
@@ -119,8 +119,9 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       }, AMBULANCE_TICK_MS);
     };
 
-    // Click handling lives inside "load" so it's a no-op until the route source/layer exist —
-    // otherwise a click during the brief load window would place a marker with no route drawn.
+    // El manejo de clicks vive dentro de "load" para que sea un no-op hasta que existan la
+    // fuente/capa de la ruta — si no, un click durante la breve ventana de carga colocaría un
+    // marcador sin ruta dibujada.
     map.on("load", () => {
       map.addSource(ROUTE_SOURCE_ID, {
         type: "geojson",
@@ -156,19 +157,21 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
           const origin = { lng, lat };
           const destination = { lng: REBAGLIATI[0], lat: REBAGLIATI[1] };
           const fetchOptions = { signal: abortController.signal };
-          // Two separate fetches on purpose: the drawn route/ETA reflects real traffic (what a
-          // normal car would experience); the ambulance's own pace never does (priority vehicle).
+          // Dos fetches separados a propósito: la ruta/ETA dibujada refleja tráfico real (lo que
+          // experimentaría un auto normal); el ritmo propio de la ambulancia nunca lo hace
+          // (vehículo con prioridad).
           const [displayRoute, ambulanceRoute] = await Promise.all([
             fetchDrivingRoute(origin, destination, "driving-traffic", fetchOptions),
             fetchDrivingRoute(origin, destination, "driving", fetchOptions),
           ]);
-          if (requestId !== requestIdRef.current) return; // superseded by a later click
+          if (requestId !== requestIdRef.current) return; // reemplazado por un click posterior
 
           routeSource()?.setData(toRouteFeature(displayRoute.geometry));
           onRouteStateChange({ status: "ready", route: displayRoute });
 
-          // ruta-ambulancia-1 carries the ambulance's own route (not the traffic-aware display
-          // route) so a subscriber's line matches the position updates on ambulancia-1 exactly.
+          // ruta-ambulancia-1 lleva la ruta propia de la ambulancia (no la ruta de tráfico que
+          // se muestra) para que la línea de un suscriptor coincida exactamente con las
+          // actualizaciones de posición en ambulancia-1.
           routeChannel
             .send({
               content: {

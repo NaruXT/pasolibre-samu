@@ -13,7 +13,7 @@ export interface DrivingRoute {
   durationSeconds: number;
 }
 
-/** Distinguishes "still loading" from "failed" — a plain nullable route can't. */
+/** Distingue "todavía cargando" de "falló" — una ruta simplemente nullable no puede. */
 export type RouteState =
   | { status: "idle" }
   | { status: "loading" }
@@ -30,9 +30,10 @@ interface MapboxDirectionsResponse {
 }
 
 /**
- * "driving-traffic" for the user-facing ETA preview; "driving" (no traffic) for anything
- * deriving the ambulance's own pace — CLAUDE.md's invariant is the ambulance is never slowed
- * by traffic. Required (not defaulted) so every call site has to make this choice on purpose.
+ * "driving-traffic" para el ETA que ve el usuario; "driving" (sin tráfico) para todo lo que
+ * derive el ritmo propio de la ambulancia — el invariante de CLAUDE.md es que la ambulancia
+ * nunca se ralentiza por tráfico. Obligatorio (sin default) para que cada sitio de llamada
+ * tenga que elegir a propósito.
  */
 export type DrivingProfile = "driving" | "driving-traffic";
 
