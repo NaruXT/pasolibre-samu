@@ -62,21 +62,35 @@ function toRutasEnProcesoFeatureCollection(
   }));
 }
 
-function createAmbulanceElement(): HTMLDivElement {
-  const el = document.createElement("div");
-  el.textContent = "🚑";
-  el.style.fontSize = "24px";
-  el.style.lineHeight = "1";
-  return el;
+/**
+ * Devuelve dos elementos, no uno — bug real encontrado en vivo (issue #20, post-#23): Mapbox GL
+ * JS (v3, confirmado en su fuente — `Marker#_evaluateOpacity`) sobreescribe
+ * `elementoRaíz.style.opacity` en cada `_update()` (cada tick de posición, cada pan/zoom) con
+ * `1 - fogOpacity`, como parte de su propio sistema de oclusión atmosférica — el estilo
+ * "streets-v12" trae niebla por default en v3, así que ese valor es efectivamente `1` casi
+ * siempre, pisando silenciosamente cualquier opacidad manual puesta en el elemento que
+ * `marker.getElement()` devuelve. `raiz` es el elemento que Mapbox gestiona (nunca se le toca
+ * `opacity` desde acá); `interior` es un hijo que Mapbox nunca mira, así que la opacidad puesta
+ * ahí sobrevive indefinidamente.
+ */
+function createAmbulanceElement(): { raiz: HTMLDivElement; interior: HTMLDivElement } {
+  const raiz = document.createElement("div");
+  const interior = document.createElement("div");
+  interior.textContent = "🚑";
+  interior.style.fontSize = "24px";
+  interior.style.lineHeight = "1";
+  raiz.appendChild(interior);
+  return { raiz, interior };
 }
 
 /**
  * Issue #20, post-#23: opacidad del marker según estado real — bug real reportado por el
  * usuario ("no entiendo por qué todas las ambulancias están ocupadas"): antes no había forma
- * visual de distinguir una unidad libre de una ocupada, todas se veían idénticas.
+ * visual de distinguir una unidad libre de una ocupada, todas se veían idénticas. Recibe el
+ * elemento INTERIOR (ver `createAmbulanceElement`), no el marker ni su elemento raíz.
  */
-function aplicarEstadoAlMarker(marker: mapboxgl.Marker, estado: "libre" | "en_proceso"): void {
-  marker.getElement().style.opacity = OPACIDAD_MARKER_POR_ESTADO[estado];
+function aplicarEstadoAlMarker(elementoInterior: HTMLDivElement, estado: "libre" | "en_proceso"): void {
+  elementoInterior.style.opacity = OPACIDAD_MARKER_POR_ESTADO[estado];
 }
 
 interface PopupFinDeTurno {
@@ -163,6 +177,9 @@ interface AmbulanceInstance {
   id: string;
   tipo: AmbulanciaActivaPayload["tipo"];
   marker: mapboxgl.Marker;
+  // Elemento interior del marker (ver `createAmbulanceElement`) — donde vive la opacidad real,
+  // no en `marker.getElement()` (Mapbox la pisa en cada tick, ver `aplicarEstadoAlMarker`).
+  elementoInterior: HTMLDivElement;
   semaforosPendientes: SemaforoEnRuta[];
   // Issue #20, post-#23: estado real de la unidad y geometría de su ruta vigente — leídos de
   // `RoutePublishPayload` (no ephemeral, sobrevive un refresh), no del canal de posición. Solo
@@ -244,6 +261,16 @@ export function EmergencyMap({
     if (!containerRef.current || !MAPBOX_TOKEN) return;
 
     mountedRef.current = true;
+    // Bug real reportado por el usuario ("undefined is not an object evaluating
+    // e1.getCanvasContainer().appendChild"): `mountedRef` es UN SOLO ref compartido entre
+    // reintentos del efecto (React StrictMode en dev monta→limpia→remonta el mismo componente).
+    // Si el mount viejo arranca una espera async (`esperarBackfillListo` de más abajo, hasta 2s)
+    // y se limpia (su `map` propio se destruye vía `map.remove()`) ANTES de que esa promesa
+    // resuelva, para cuando resuelve `mountedRef.current` ya está en `true` de nuevo — puesto ahí
+    // por el mount NUEVO, no por este — así que el chequeo `!mountedRef.current` no alcanza para
+    // detectar que ESTE closure específico (con su propio `map`, ya destruido) quedó obsoleto.
+    // `cancelado` es local a esta invocación del efecto — no lo pisa ningún otro mount.
+    let cancelado = false;
     // Capturado una vez: el mismo Set vive durante todo el ciclo de vida del efecto (nunca se
     // reasigna), así que leerlo acá en vez de `misSimulacionesRef.current` en cada sitio evita
     // la advertencia de exhaustive-deps sobre refs leídos en el cleanup.
@@ -521,7 +548,8 @@ export function EmergencyMap({
       // explícito del usuario: "si no tienen esos datos deben estar disponibles".
       const estadoInicial: "libre" | "en_proceso" = ruta.estado ?? "libre";
       const semaforosPendientes = semaforosEnRuta(SEMAFOROS_SAN_BORJA_Y_COLINDANTES, ruta.geometry);
-      const marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
+      const { raiz: elementoRaiz, interior: elementoInterior } = createAmbulanceElement();
+      const marker = new mapboxgl.Marker({ element: elementoRaiz })
         .setLngLat([ruta.origin.lng, ruta.origin.lat])
         .addTo(map);
 
@@ -529,7 +557,7 @@ export function EmergencyMap({
       // (`tipo: "viaje"`) no tiene concepto de "libre" para retirar.
       let popupFinDeTurno: PopupFinDeTurno | undefined;
       if (tipo === "flota") {
-        aplicarEstadoAlMarker(marker, estadoInicial);
+        aplicarEstadoAlMarker(elementoInterior, estadoInicial);
         popupFinDeTurno = crearPopupFinDeTurno(async () => {
           const response = await fetch(`/api/fleet/${ambulanceId}/enroll`, { method: "DELETE" });
           if (!response.ok) {
@@ -562,7 +590,7 @@ export function EmergencyMap({
           const estado = ultimaRuta.estado ?? "libre";
           instancia.estado = estado;
           instancia.rutaGeometry = ultimaRuta.geometry;
-          aplicarEstadoAlMarker(instancia.marker, estado);
+          aplicarEstadoAlMarker(instancia.elementoInterior, estado);
           popupFinDeTurno?.actualizarEstado(estado);
           recalcularRutasEnProceso();
         }
@@ -591,6 +619,7 @@ export function EmergencyMap({
         id: ambulanceId,
         tipo,
         marker,
+        elementoInterior,
         semaforosPendientes,
         estado: estadoInicial,
         rutaGeometry: ruta.geometry,
@@ -619,7 +648,7 @@ export function EmergencyMap({
     // filtro llegue demasiado tarde para cientos de ids históricos a la vez.
     let cancelarAnuncios: () => void = () => {};
     void esperarBackfillListo(ambulanciasDetenidasChannel).then(() => {
-      if (!mountedRef.current) return;
+      if (cancelado || !mountedRef.current) return;
       cancelarAnuncios = ambulanciasActivasChannel.subscribe(procesarAnunciosDeRegistro);
       procesarAnunciosDeRegistro();
     });
@@ -739,6 +768,7 @@ export function EmergencyMap({
 
     return () => {
       mountedRef.current = false;
+      cancelado = true;
       // Cubre el desmontaje "normal" (ej. Fast Refresh en dev, o si este componente algún día
       // se desmonta desde una navegación SPA) — el caso de recarga dura/cierre de pestaña ya lo
       // cubrió `pagehide` arriba, no este cleanup.
