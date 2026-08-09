@@ -79,7 +79,8 @@ async function publicarRuta(
   ambulanceId: string,
   ruta: DrivingRoute,
   origin: LngLat,
-  destination: LngLat
+  destination: LngLat,
+  estado?: EstadoUnidadFlota
 ): Promise<void> {
   const rutaChannel = await obtenerCanalServidor<RoutePublishPayload>(rutaAmbulanciaChannelId(ambulanceId));
   await rutaChannel.send({
@@ -90,6 +91,7 @@ async function publicarRuta(
       durationSeconds: ruta.durationSeconds,
       origin,
       destination,
+      estado,
     },
   });
 }
@@ -113,7 +115,7 @@ async function iniciarPatrullaje(ambulanceId: string, origen: LngLat): Promise<v
 
   const destino = puntoDeVuelta(origen);
   const rutaPatrullaje = await fetchDrivingRoute(origen, destino, "driving");
-  await publicarRuta(ambulanceId, rutaPatrullaje, origen, destino);
+  await publicarRuta(ambulanceId, rutaPatrullaje, origen, destino, "libre");
 
   const ambulanceChannel = await obtenerCanalServidor<AmbulancePositionPayload>(
     ambulanciaChannelId(ambulanceId)
@@ -214,7 +216,7 @@ async function iniciarTramo(
   // en paralelo para siempre, publicando posiciones de patrullaje encima de las del tramo real.
   cacheFlota.__flotaActiva!.get(ambulanceId)?.detener();
 
-  await publicarRuta(ambulanceId, ruta, origin, destination);
+  await publicarRuta(ambulanceId, ruta, origin, destination, "en_proceso");
 
   const semaforosPendientes: SemaforoEnRuta[] = semaforosEnRuta(
     SEMAFOROS_SAN_BORJA_Y_COLINDANTES,

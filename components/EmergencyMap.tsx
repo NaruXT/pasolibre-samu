@@ -35,16 +35,31 @@ const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 // calcula por hospital más cercano en tiempo real a partir del punto de emergencia elegido.
 const CORRIDOR_START: [number, number] = [-76.9973, -12.0905];
 
+// Issue #20, post-#23: reusado para dibujar el corredor real (origen→destino) de cada unidad de
+// flota `en_proceso` — antes solo dibujaba la línea "de tráfico" del flujo default (issue #20/#23
+// R0 lo dejó huérfano al hacer que un click plano ya no cree nada). Ahora es una FeatureCollection
+// con una línea por unidad ocupada, no un único Feature — puede haber varias a la vez.
 const ROUTE_SOURCE_ID = "emergency-route";
 const ROUTE_LAYER_ID = "emergency-route-line";
-const EMPTY_ROUTE_GEOMETRY: LineString = { type: "LineString", coordinates: [] };
 
 // A pedido del usuario: sin esto, una ambulancia que llega a destino queda congelada en el mapa
 // para siempre (nadie la remueve) — se ve el marker "llegar" un momento y después desaparece.
 const TIEMPO_VISIBLE_TRAS_LLEGAR_MS = 4000;
 
-function toRouteFeature(geometry: LineString): Feature<LineString> {
-  return { type: "Feature", properties: {}, geometry };
+/** Opacidad del marker según estado — bug real reportado por el usuario: no había forma visual de distinguir una unidad libre de una ocupada. */
+const OPACIDAD_MARKER_POR_ESTADO: Record<"libre" | "en_proceso", string> = {
+  libre: "1",
+  en_proceso: "0.5",
+};
+
+function toRutasEnProcesoFeatureCollection(
+  rutas: readonly { ambulanceId: string; geometry: LineString }[]
+): Feature<LineString>[] {
+  return rutas.map((r) => ({
+    type: "Feature",
+    properties: { ambulanceId: r.ambulanceId },
+    geometry: r.geometry,
+  }));
 }
 
 function createAmbulanceElement(): HTMLDivElement {
@@ -56,13 +71,28 @@ function createAmbulanceElement(): HTMLDivElement {
 }
 
 /**
+ * Issue #20, post-#23: opacidad del marker según estado real — bug real reportado por el
+ * usuario ("no entiendo por qué todas las ambulancias están ocupadas"): antes no había forma
+ * visual de distinguir una unidad libre de una ocupada, todas se veían idénticas.
+ */
+function aplicarEstadoAlMarker(marker: mapboxgl.Marker, estado: "libre" | "en_proceso"): void {
+  marker.getElement().style.opacity = OPACIDAD_MARKER_POR_ESTADO[estado];
+}
+
+interface PopupFinDeTurno {
+  elemento: HTMLElement;
+  /** Refleja el estado real en el texto y oculta el botón mientras la unidad está `en_proceso` (R3 — "Fin de turno" solo aplica a unidades libres). */
+  actualizarEstado: (estado: "libre" | "en_proceso") => void;
+}
+
+/**
  * Popup de "Fin de turno" (issue #20/#22) — solo se adjunta a unidades de flota (`tipo:
  * "flota"`), nunca a un viaje efímero (`simulacion.ts`), que no tiene concepto de "libre" para
  * retirar. `onFinDeTurno` dispara el DELETE y deshabilita el botón mientras está en vuelo — el
  * marker lo remueve `procesarDetenciones` cuando llega el aviso por `ambulancias-detenidas`
  * (mismo mecanismo ya usado para el resto de retiros), no este código.
  */
-function crearPopupFinDeTurno(onFinDeTurno: () => Promise<void>): HTMLElement {
+function crearPopupFinDeTurno(onFinDeTurno: () => Promise<void>): PopupFinDeTurno {
   const contenedor = document.createElement("div");
   contenedor.style.maxWidth = "180px";
   contenedor.style.fontSize = "13px";
@@ -78,7 +108,6 @@ function crearPopupFinDeTurno(onFinDeTurno: () => Promise<void>): HTMLElement {
   const texto = document.createElement("div");
   texto.style.marginBottom = "8px";
   texto.style.color = COLOR_TEXTO_POPUP;
-  texto.textContent = "Unidad libre, patrullando.";
   contenedor.appendChild(texto);
 
   const boton = document.createElement("button");
@@ -106,7 +135,17 @@ function crearPopupFinDeTurno(onFinDeTurno: () => Promise<void>): HTMLElement {
   });
   contenedor.appendChild(boton);
 
-  return contenedor;
+  const actualizarEstado = (estado: "libre" | "en_proceso") => {
+    if (estado === "libre") {
+      texto.textContent = "Unidad libre, patrullando.";
+      boton.style.display = "";
+    } else {
+      texto.textContent = "Unidad en camino, atendiendo una llamada.";
+      boton.style.display = "none";
+    }
+  };
+
+  return { elemento: contenedor, actualizarEstado };
 }
 
 export interface EmergencyPoint {
@@ -122,8 +161,14 @@ export interface HospitalDestino {
 
 interface AmbulanceInstance {
   id: string;
+  tipo: AmbulanciaActivaPayload["tipo"];
   marker: mapboxgl.Marker;
   semaforosPendientes: SemaforoEnRuta[];
+  // Issue #20, post-#23: estado real de la unidad y geometría de su ruta vigente — leídos de
+  // `RoutePublishPayload` (no ephemeral, sobrevive un refresh), no del canal de posición. Solo
+  // tiene sentido para `tipo === "flota"`; un viaje efímero no tiene concepto de "libre".
+  estado: "libre" | "en_proceso";
+  rutaGeometry: LineString;
   // Issue #12/#15: canal Portal real y propio de esta ambulancia (no uno compartido) — se
   // adquiere al arrancar/observar la instancia y se libera al detenerla.
   routeChannel: ChannelHandle<RoutePublishPayload>;
@@ -298,6 +343,22 @@ export function EmergencyMap({
       setSemaforosVisibles([...vistos.values()]);
     };
 
+    const routeSource = () => map.getSource(ROUTE_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
+
+    // Issue #20, post-#23: dibuja el corredor real (origen→destino) de cada unidad de flota
+    // `en_proceso` — a pedido del usuario, para que una unidad ocupada siempre muestre a dónde va,
+    // incluso después de recargar la página (la fuente de verdad es `estado` en `RoutePublishPayload`,
+    // no ephemeral, así que sobrevive un refresh sin depender de haber visto un tick en vivo).
+    const recalcularRutasEnProceso = () => {
+      const rutas = [...ambulanceInstancesRef.current.values()]
+        .filter((instancia) => instancia.tipo === "flota" && instancia.estado === "en_proceso")
+        .map((instancia) => ({ ambulanceId: instancia.id, geometry: instancia.rutaGeometry }));
+      routeSource()?.setData({
+        type: "FeatureCollection",
+        features: toRutasEnProcesoFeatureCollection(rutas),
+      });
+    };
+
     const detenerInstancia = (id: string) => {
       const instancia = ambulanceInstancesRef.current.get(id);
       if (!instancia) return;
@@ -313,6 +374,7 @@ export function EmergencyMap({
     const detenerTodasLasInstancias = () => {
       for (const id of [...ambulanceInstancesRef.current.keys()]) detenerInstancia(id);
       recalcularSemaforosVisibles();
+      recalcularRutasEnProceso();
     };
 
     // Reacciona a `ambulancias-detenidas` (backfill + en vivo, mismo patrón que el registro):
@@ -326,11 +388,39 @@ export function EmergencyMap({
         if (ambulanceInstancesRef.current.has(ambulanceId)) {
           detenerInstancia(ambulanceId);
           recalcularSemaforosVisibles();
+          recalcularRutasEnProceso();
         }
       }
     };
     const cancelarDetenciones = ambulanciasDetenidasChannel.subscribe(procesarDetenciones);
     procesarDetenciones();
+
+    // Bug real encontrado post-#23 (issue #20): `ambulancias-activas` ahora se lee con
+    // `history: 500` (fix del bug de fantasmas, ver más abajo) — con una sesión de pruebas
+    // extensa, eso significa que CUALQUIER carga de página intenta `observarAmbulancia` para
+    // cientos de ids históricos, la enorme mayoría ya muertos, ANTES de que el backfill de
+    // `ambulancias-detenidas` tenga chance de decirle a este cliente cuáles son. Cada intento
+    // abre su propio par de canales (ruta + posición) y espera hasta 5s+ por una ruta que nunca
+    // va a llegar — cientos de conexiones simultáneas generan caos de timing real (confirmado en
+    // vivo: unidades genuinamente vivas y `en_proceso` mostrándose como libres, o directamente
+    // fallando con "no se encontró ruta"). Mismo patrón que `esperarBackfillDe` del lado
+    // servidor (`lib/portal/serverReader.ts`): espera al primer `subscribe()` de detenidas (o un
+    // timeout corto) antes de arrancar el procesamiento de anuncios, para que la gran mayoría de
+    // los ids ya-muertos se filtren por el chequeo de `idsDetenidosRef` sin abrir ningún canal.
+    const esperarBackfillListo = (canal: ChannelHandle<unknown>, timeoutMs = 2000): Promise<void> => {
+      return new Promise((resolve) => {
+        let cancelar: () => void = () => {};
+        const temporizador = setTimeout(() => {
+          cancelar();
+          resolve();
+        }, timeoutMs);
+        cancelar = canal.subscribe(() => {
+          clearTimeout(temporizador);
+          cancelar();
+          resolve();
+        });
+      });
+    };
 
     // Issue #12/#16: espera al primer mensaje ya publicado de `canal` — NO alcanza con esperar
     // `status === "ready"` (descubierto en vivo probando este mismo slice): el backfill de
@@ -339,27 +429,47 @@ export function EmergencyMap({
     // el "useSyncExternalStore-shaped store contract" documentado por el SDK para reaccionar a
     // cambios en `.messages`, así que re-chequear ahí (en vez de una sola lectura puntual) es la
     // forma correcta de esperar el backfill.
+    // Bug real encontrado post-#23 (issue #20): resolvía en cuanto `.messages` tenía CUALQUIER
+    // mensaje, sin esperar a que el backfill terminara de llegar — inofensivo mientras cada
+    // ambulancia solo publicaba una ruta en toda su vida (un viaje efímero: el primer mensaje ES
+    // el último), pero una unidad de flota publica una ruta nueva por cada tramo, así que "el
+    // primero que llegó" ya no es necesariamente "el vigente ahora" si el backfill de varios
+    // mensajes no llega como un solo evento atómico. Confirmado en vivo: una unidad `en_proceso`
+    // se observaba con su ruta de patrullaje vieja (la primera publicada en su vida), mostrando
+    // `estado: "libre"` en el mapa aunque la unidad ya llevaba minutos en camino a una llamada
+    // real. Corregido con un debounce: espera a que `.messages` deje de crecer por `debounceMs`
+    // antes de resolver, no solo a que aparezca el primer mensaje.
     const esperarPrimerMensaje = <M,>(
       canal: ChannelHandle<M>,
-      timeoutMs = 5000
+      timeoutMs = 5000,
+      debounceMs = 400
     ): Promise<M | undefined> => {
       const ultimoMensaje = () => canal.messages[canal.messages.length - 1]?.content;
-      const yaDisponible = ultimoMensaje();
-      if (yaDisponible !== undefined) return Promise.resolve(yaDisponible);
 
       return new Promise((resolve) => {
+        let resuelto = false;
         let cancelar: () => void = () => {};
-        const temporizador = setTimeout(() => {
+        let temporizadorSettle: ReturnType<typeof setTimeout> | null = null;
+
+        const finalizar = () => {
+          if (resuelto) return;
+          resuelto = true;
+          clearTimeout(temporizadorTimeout);
+          if (temporizadorSettle) clearTimeout(temporizadorSettle);
           cancelar();
-          resolve(undefined);
-        }, timeoutMs);
+          resolve(ultimoMensaje());
+        };
+
+        const temporizadorTimeout = setTimeout(finalizar, timeoutMs);
+
+        const programarSettle = () => {
+          if (temporizadorSettle) clearTimeout(temporizadorSettle);
+          temporizadorSettle = setTimeout(finalizar, debounceMs);
+        };
+
+        if (ultimoMensaje() !== undefined) programarSettle();
         cancelar = canal.subscribe(() => {
-          const mensaje = ultimoMensaje();
-          if (mensaje !== undefined) {
-            clearTimeout(temporizador);
-            cancelar();
-            resolve(mensaje);
-          }
+          if (ultimoMensaje() !== undefined) programarSettle();
         });
       });
     };
@@ -404,10 +514,32 @@ export function EmergencyMap({
         return;
       }
 
+      // Issue #20, post-#23: la fuente de verdad del estado real (libre/en_proceso) es
+      // `RoutePublishPayload.estado` — no ephemeral, así que sobrevive un refresh de la página
+      // sin depender de haber visto un tick en vivo. `undefined` (viaje efímero, GPS real, o una
+      // ruta vieja publicada antes de que este campo existiera) se trata como "libre" — a pedido
+      // explícito del usuario: "si no tienen esos datos deben estar disponibles".
+      const estadoInicial: "libre" | "en_proceso" = ruta.estado ?? "libre";
       const semaforosPendientes = semaforosEnRuta(SEMAFOROS_SAN_BORJA_Y_COLINDANTES, ruta.geometry);
       const marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
         .setLngLat([ruta.origin.lng, ruta.origin.lat])
         .addTo(map);
+
+      // Issue #20/#22: solo una unidad de flota ofrece "Fin de turno" — un viaje efímero
+      // (`tipo: "viaje"`) no tiene concepto de "libre" para retirar.
+      let popupFinDeTurno: PopupFinDeTurno | undefined;
+      if (tipo === "flota") {
+        aplicarEstadoAlMarker(marker, estadoInicial);
+        popupFinDeTurno = crearPopupFinDeTurno(async () => {
+          const response = await fetch(`/api/fleet/${ambulanceId}/enroll`, { method: "DELETE" });
+          if (!response.ok) {
+            throw new Error(`No se pudo dar de baja la unidad (${response.status}).`);
+          }
+        });
+        popupFinDeTurno.actualizarEstado(estadoInicial);
+        const popup = new mapboxgl.Popup({ offset: 14 }).setDOMContent(popupFinDeTurno.elemento);
+        marker.setPopup(popup);
+      }
 
       // Issue #20/#23: una unidad de flota despachada publica una ruta NUEVA en cada transición
       // de tramo (patrullaje → recogida → hospital → patrullaje) al mismo `routeChannel` — sin
@@ -416,6 +548,8 @@ export function EmergencyMap({
       // ambulancia por primera vez. `subscribe()` solo dispara para mensajes FUTUROS (no
       // re-dispara para el ya consumido por `esperarPrimerMensaje` arriba), así que no hay
       // recómputo redundante en el caso común de un viaje efímero (una sola ruta en su vida).
+      // También es acá donde se recoge el `estado` de cada transición — marker/popup/línea del
+      // corredor real se actualizan en el mismo lugar que ya reaccionaba a rutas nuevas.
       const actualizarRutaYSemaforos = () => {
         const ultimaRuta = routeChannel.messages[routeChannel.messages.length - 1]?.content;
         if (!ultimaRuta || !mountedRef.current) return;
@@ -423,22 +557,17 @@ export function EmergencyMap({
         if (!instancia) return;
         instancia.semaforosPendientes = semaforosEnRuta(SEMAFOROS_SAN_BORJA_Y_COLINDANTES, ultimaRuta.geometry);
         recalcularSemaforosVisibles();
+
+        if (tipo === "flota") {
+          const estado = ultimaRuta.estado ?? "libre";
+          instancia.estado = estado;
+          instancia.rutaGeometry = ultimaRuta.geometry;
+          aplicarEstadoAlMarker(instancia.marker, estado);
+          popupFinDeTurno?.actualizarEstado(estado);
+          recalcularRutasEnProceso();
+        }
       };
       const cancelarRuta = routeChannel.subscribe(actualizarRutaYSemaforos);
-
-      // Issue #20/#22: solo una unidad de flota ofrece "Fin de turno" — un viaje efímero
-      // (`tipo: "viaje"`) no tiene concepto de "libre" para retirar.
-      if (tipo === "flota") {
-        const popup = new mapboxgl.Popup({ offset: 14 }).setDOMContent(
-          crearPopupFinDeTurno(async () => {
-            const response = await fetch(`/api/fleet/${ambulanceId}/enroll`, { method: "DELETE" });
-            if (!response.ok) {
-              throw new Error(`No se pudo dar de baja la unidad (${response.status}).`);
-            }
-          })
-        );
-        marker.setPopup(popup);
-      }
 
       const fuente: PosicionSource = new RealPosicionSource(ambulanceChannel);
       const detenerFuente = fuente.suscribir((posicion) => {
@@ -453,20 +582,25 @@ export function EmergencyMap({
             if (!mountedRef.current) return;
             detenerInstancia(ambulanceId);
             recalcularSemaforosVisibles();
+            recalcularRutasEnProceso();
           }, TIEMPO_VISIBLE_TRAS_LLEGAR_MS);
         }
       });
 
       ambulanceInstancesRef.current.set(ambulanceId, {
         id: ambulanceId,
+        tipo,
         marker,
         semaforosPendientes,
+        estado: estadoInicial,
+        rutaGeometry: ruta.geometry,
         routeChannel,
         ambulanceChannel,
         detenerFuente,
         cancelarRuta,
       });
       recalcularSemaforosVisibles();
+      recalcularRutasEnProceso();
     };
 
     // Backfill (ambulancias ya anunciadas antes de este mount) + descubrimiento en vivo, en un
@@ -479,8 +613,16 @@ export function EmergencyMap({
         void observarAmbulancia(msg.content.ambulanceId, msg.content.tipo);
       }
     };
-    const cancelarAnuncios = ambulanciasActivasChannel.subscribe(procesarAnunciosDeRegistro);
-    procesarAnunciosDeRegistro();
+    // Gate real (ver el comentario junto a `esperarBackfillListo` más arriba): no arranca el
+    // procesamiento de `ambulancias-activas` hasta que `ambulancias-detenidas` tuvo su primera
+    // chance de backfillear — `idsDetenidosRef` ya filtra por diseño, esto solo evita que ese
+    // filtro llegue demasiado tarde para cientos de ids históricos a la vez.
+    let cancelarAnuncios: () => void = () => {};
+    void esperarBackfillListo(ambulanciasDetenidasChannel).then(() => {
+      if (!mountedRef.current) return;
+      cancelarAnuncios = ambulanciasActivasChannel.subscribe(procesarAnunciosDeRegistro);
+      procesarAnunciosDeRegistro();
+    });
 
     // El manejo de clicks vive dentro de "load" para que sea un no-op hasta que existan la
     // fuente/capa de la ruta — si no, un click durante la breve ventana de carga colocaría un
@@ -488,14 +630,14 @@ export function EmergencyMap({
     map.on("load", () => {
       map.addSource(ROUTE_SOURCE_ID, {
         type: "geojson",
-        data: toRouteFeature(EMPTY_ROUTE_GEOMETRY),
+        data: { type: "FeatureCollection", features: [] },
       });
       map.addLayer({
         id: ROUTE_LAYER_ID,
         type: "line",
         source: ROUTE_SOURCE_ID,
         layout: { "line-cap": "round", "line-join": "round" },
-        paint: { "line-color": "#2563eb", "line-width": 5, "line-opacity": 0.85 },
+        paint: { "line-color": "#f97316", "line-width": 4, "line-opacity": 0.85, "line-dasharray": [2, 1] },
       });
 
       setLoadedMap(map);
