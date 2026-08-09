@@ -8,7 +8,7 @@ Toda la lógica de dominio y los I/O boundaries del proyecto (orquestación de t
 
 - `lib/tick/` — el seam de orquestación: `orquestarTick` (ETA → fase → TomTom → LLM → publish), `agent.ts` (LLM), `decision.ts`, `eta.ts`, `simulacion.ts` (ciclo de vida de ambulancias simuladas, corre server-side), `deps.ts` (factory de dependencias reales, compartida entre `/api/tick` y `/api/ambulance/[id]/position`).
 - `lib/portal/` — cliente, constantes de canales, shapes de mensajes, y lectura server-side vía WebSocket anónimo (`serverReader.ts`).
-- `lib/semaforo/` — fase determinística del semáforo (`fase.ts`, `faseEfectiva.ts`) + dataset real de 962 nodos OSM (`semaforosSanBorjaYColindantes.ts`, ~87KB — es el archivo que hace que este directorio cruce el umbral de tokens, no complejidad de lógica).
+- `lib/semaforo/` — fase determinística del semáforo (`fase.ts`, `faseEfectiva.ts`) + dataset real de 3784 nodos OSM cubriendo Lima Metropolitana completa (`semaforosSanBorjaYColindantes.ts`, ~331KB — es el archivo que hace que este directorio cruce el umbral de tokens, no complejidad de lógica).
 - `lib/hospital/` — selección de hospital más cercano por ruta real (`hospitalMasCercano.ts`) + dataset real de 20 hospitales OSM.
 - `lib/mapbox/` — Directions API (`directions.ts`) + fuentes de posición intercambiables (`posicionSource.ts`: interpolada vs. GPS real).
 - `lib/tomtom/` — Traffic Flow API para congestión cruzada en cada semáforo.
