@@ -96,7 +96,10 @@ function crearPopupFinDeTurno(onFinDeTurno: () => Promise<void>): HTMLElement {
     boton.disabled = true;
     boton.textContent = "Retirando…";
     void onFinDeTurno().catch((error) => {
-      console.error("No se pudo dar de baja la unidad:", error);
+      // `console.warn`, no `console.error` — mismo motivo que en el click handler principal:
+      // Next.js dev muestra un overlay bloqueante ante `console.error`, incluso para un
+      // resultado esperado (ej. unidad todavía `en_proceso`, 409).
+      console.warn("No se pudo dar de baja la unidad:", error);
       boton.disabled = false;
       boton.textContent = "Fin de turno";
     });
@@ -544,7 +547,12 @@ export function EmergencyMap({
             // Mismo canal de error genérico que usa el flujo "Agregar ambulancia" (ver
             // `app/page.tsx`: deliberadamente no condicionado a que exista un `emergencyPoint`).
             onRouteStateChange({ status: "error", message });
-            console.error("No se pudo asignar una unidad a la llamada de emergencia:", error);
+            // `console.warn`, no `console.error` — bug real reportado por el usuario: Next.js
+            // dev intercepta `console.error` y muestra su overlay de error a pantalla completa,
+            // incluso para un resultado esperado y ya manejado (ej. "no hay unidad libre", 409),
+            // que además ya se muestra en el header vía `onRouteStateChange`. Un overlay
+            // bloqueante para un caso de negocio normal (no un bug) es peor UX que no loguear.
+            console.warn("No se pudo asignar una unidad a la llamada de emergencia:", error);
           }
           return;
         }
@@ -578,7 +586,11 @@ export function EmergencyMap({
           if (!mountedRef.current) return;
           const message = error instanceof Error ? error.message : String(error);
           onRouteStateChange({ status: "error", message });
-          console.error("No se pudo dar de alta la unidad:", error);
+          // `console.warn`, no `console.error` — ver la nota equivalente en la rama `esLlamada`
+          // de este mismo handler: Next.js dev muestra un overlay bloqueante ante `console.error`
+          // incluso para resultados esperados y ya manejados (ej. tope de flota alcanzado, 429),
+          // que ya se muestran en el header vía `onRouteStateChange`.
+          console.warn("No se pudo dar de alta la unidad:", error);
         }
       });
     });
