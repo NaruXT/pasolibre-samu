@@ -27,7 +27,6 @@ import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBo
 import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
 import { HOSPITALES_SAN_BORJA_Y_COLINDANTES } from "@/lib/hospital/hospitalesSanBorjaYColindantes";
 import type { DecisionSemaforo, DecisionSemaforoPublicada } from "@/lib/tick/decision";
-import type { ResultadoIniciarSimulacion } from "@/lib/tick/simulacion";
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
@@ -149,9 +148,6 @@ export function EmergencyMap({
   onDestinationChange,
 }: EmergencyMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const markerRef = useRef<mapboxgl.Marker | null>(null);
-  const requestIdRef = useRef(0);
-  const abortControllerRef = useRef<AbortController | null>(null);
   // Issue #12/#14: varias ambulancias simuladas a la vez, cada una con su propio marker/timer/
   // ruta/semáforos pendientes — reemplaza los refs singulares que solo soportaban una. Clickear
   // el mapa en modo default sigue reseteando todo (comportamiento original); "Agregar ambulancia"
@@ -241,8 +237,14 @@ export function EmergencyMap({
     // arrancar, para que un watcher (ej. /ambulance-watch) sepa qué canales por-ambulancia
     // suscribir dinámicamente. Los canales de ruta/posición en sí ya no son compartidos (ver
     // AmbulanceInstance) — este cliente adquiere los suyos al observarla en `observarAmbulancia`.
+    // `history: 500` explícito — bug real encontrado post-#23: el default del SDK sin esta
+    // opción es 50 mensajes (confirmado en su fuente), y una sesión de pruebas extensa supera
+    // eso fácil — sin esto el cliente queda ciego a anuncios más viejos que los últimos 50 y
+    // vuelve a mostrar ambulancias fantasma que el servidor ya reconcilió como detenidas (que
+    // caerían fuera de la misma ventana de 50 en `ambulancias-detenidas`, ver más abajo).
     const ambulanciasActivasChannel = portalClient.channel<AmbulanciaActivaPayload>(
-      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
+      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+      { history: 500 }
     );
     ambulanciasActivasChannel.acquire();
 
@@ -276,7 +278,8 @@ export function EmergencyMap({
     // el orden de declaración acá no importa en la práctica, pero el de *invocación* sí: el
     // `.subscribe()` real ocurre recién después de que ambas estén definidas.
     const ambulanciasDetenidasChannel = portalClient.channel<AmbulanciaDetenidaPayload>(
-      PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+      PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID,
+      { history: 500 }
     );
     ambulanciasDetenidasChannel.acquire();
 
@@ -546,103 +549,42 @@ export function EmergencyMap({
           return;
         }
 
+        // Issue #20/#23 (R0, shaping doc): un click sin ningún botón armado ya no crea nada —
+        // bug real confirmado por el usuario, decidido en el shaping de #20 pero nunca convertido
+        // en criterio de aceptación de ningún ticket, así que el viejo flujo "click plano crea un
+        // viaje efímero buscando hospital" seguía disparándose. `/api/ambulance/[id]/simulate`
+        // (`lib/tick/simulacion.ts`) queda huérfano, sin ningún caller — mismo criterio ya
+        // aplicado a `/api/tick` (ver CLAUDE.md), no se borra por si hace falta reactivarlo.
+        if (!esAgregar) return;
+
         const ambulanceId = crypto.randomUUID();
-        const routeSource = () =>
-          map.getSource(ROUTE_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
-
-        let requestId = -1;
-        let fetchOptions: { signal: AbortSignal };
-        if (esAgregar) {
-          fetchOptions = { signal: new AbortController().signal };
-        } else {
-          // A pedido del usuario: resetear el mapa también detiene, en el servidor, las
-          // simulaciones que ESTE cliente arrancó — no solo deja de observarlas acá. Sin esto
-          // quedarían corriendo para siempre (cada tick real gasta cuota del LLM).
-          detenerMisSimulaciones();
-          detenerTodasLasInstancias();
-          markerRef.current?.remove();
-          markerRef.current = new mapboxgl.Marker({ color: "#dc2626" })
-            .setLngLat([lng, lat])
-            .addTo(map);
-
-          onEmergencyPointChange({ lng, lat });
-          onRouteStateChange({ status: "loading" });
-
-          abortControllerRef.current?.abort();
-          const abortController = new AbortController();
-          abortControllerRef.current = abortController;
-          requestId = ++requestIdRef.current;
-          fetchOptions = { signal: abortController.signal };
-        }
-        // Para el flujo default, un click posterior invalida este: comparar contra
-        // requestIdRef.current. El flujo "agregar" no se cancela por otros clicks — cada
-        // ambulancia agregada corre independiente hasta resolver o fallar.
-        const sigueVigente = () => esAgregar || requestId === requestIdRef.current;
-
         try {
-          // Issue #20/#21: "Agregar ambulancia" ya no arranca un viaje — da de alta una unidad
-          // de flota que patrulla libre, sin destino, hasta que una llamada de emergencia futura
-          // (slice 3/3, todavía no implementado) la asigne. El flujo default sigue exactamente
-          // igual que antes (post-slice #16: el servidor calcula hospital/ruta y mueve la
-          // ambulancia sin depender de que esta pestaña siga abierta).
-          const endpoint = esAgregar
-            ? `/api/fleet/${ambulanceId}/enroll`
-            : `/api/ambulance/${ambulanceId}/simulate`;
-          const response = await fetch(endpoint, {
+          const response = await fetch(`/api/fleet/${ambulanceId}/enroll`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ lat, lng }),
-            signal: fetchOptions.signal,
           });
           if (!response.ok) {
-            // El body trae el mensaje real (ej. "Ya hay 8 ambulancias simuladas activas...", 429)
+            // El body trae el mensaje real (ej. "Ya hay 8 unidades de flota activas...", 429)
             // — mostrar solo el status code sería mucho menos útil que decir por qué falló.
             const cuerpo = await response.json().catch(() => null);
-            const mensajeGenerico = esAgregar
-              ? `No se pudo dar de alta la unidad (${response.status}).`
-              : `No se pudo arrancar la simulación (${response.status}).`;
-            throw new Error(cuerpo?.error ?? mensajeGenerico);
+            throw new Error(cuerpo?.error ?? `No se pudo dar de alta la unidad (${response.status}).`);
           }
-          if (!mountedRef.current || !sigueVigente()) return;
-
-          if (esAgregar) {
-            // Una unidad de flota dada de alta no es responsabilidad de esta pestaña — a
-            // diferencia de un viaje simulado (`misSimulaciones`), patrulla indefinidamente sin
-            // gastar LLM/TomTom y solo se retira con "Fin de turno" (slice 2/3), no al resetear
-            // el mapa ni al cerrar la pestaña que la creó.
-          } else {
-            const data: ResultadoIniciarSimulacion = await response.json();
-            misSimulaciones.add(ambulanceId);
-            onDestinationChange?.(data.destino);
-            // El flujo default dibuja la línea "de tráfico" (perfil driving-traffic, la que ve
-            // el usuario); con ambulancias agregadas, cada una publica su propia ruta a Portal
-            // pero no pisa esta línea (la única que se muestra en el mapa).
-            routeSource()?.setData(toRouteFeature(data.rutaTrafico.geometry));
-            onRouteStateChange({ status: "ready", route: data.rutaTrafico });
-          }
-          // El marker y la coordinación semafórica de esta ambulancia los recoge
-          // `observarAmbulancia`, ya suscrita al canal de descubrimiento — apenas el servidor
-          // publique su ruta y su anuncio, aparece igual que cualquier otra.
+          // Una unidad de flota dada de alta no es responsabilidad de esta pestaña — patrulla
+          // indefinidamente sin gastar LLM/TomTom y solo se retira con "Fin de turno". El marker
+          // y la coordinación semafórica los recoge `observarAmbulancia`, ya suscrita al canal
+          // de descubrimiento — apenas el servidor publique su ruta y su anuncio, aparece.
         } catch (error) {
-          if (!mountedRef.current || !sigueVigente()) return;
-
+          if (!mountedRef.current) return;
           const message = error instanceof Error ? error.message : String(error);
-          // El error (ej. tope alcanzado, de flota o de simulaciones) es igual de relevante en
-          // modo "agregar" — solo lo que afecta específicamente al flujo default (la línea/
-          // destino ya mostrados) queda condicionado a `!esAgregar`.
           onRouteStateChange({ status: "error", message });
-          if (!esAgregar) {
-            routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
-            onDestinationChange?.(null);
-          }
-          console.error("No se pudo completar la acción sobre la ambulancia:", error);
+          console.error("No se pudo dar de alta la unidad:", error);
         }
       });
     });
 
     return () => {
       mountedRef.current = false;
-      abortControllerRef.current?.abort();
       // Cubre el desmontaje "normal" (ej. Fast Refresh en dev, o si este componente algún día
       // se desmonta desde una navegación SPA) — el caso de recarga dura/cierre de pestaña ya lo
       // cubrió `pagehide` arriba, no este cleanup.
@@ -653,7 +595,6 @@ export function EmergencyMap({
       cancelarDecisiones();
       cancelarDetenciones();
       detenerTodasLasInstancias();
-      markerRef.current?.remove();
       map.remove();
       ambulanciasActivasChannel.release();
       decisionesChannel.release();

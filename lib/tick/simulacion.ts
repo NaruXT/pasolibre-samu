@@ -66,13 +66,20 @@ export async function reconciliarSimulacionesHuerfanas(): Promise<void> {
   cacheSimulaciones.__huerfanasReconciliadas = true;
 
   try {
+    // `history: 500` explícito — el default del SDK sin esta opción es 50 (confirmado en su
+    // fuente: `deps.options?.history ?? 50`), y una sesión de pruebas extensa supera esas 50
+    // fácil. Sin esto, esta misma función queda ciega a cualquier anuncio/detención más viejo
+    // que los últimos 50 mensajes de cada canal, y deja huérfanas sin reconciliar para siempre
+    // (bug real encontrado post-#23: 13 ambulancias fantasma nunca marcadas como detenidas).
     const activasChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
-      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
+      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+      { history: 500 }
     );
     await esperarBackfillDe(PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID, activasChannel);
 
     const detenidasChannel = await obtenerCanalServidor<AmbulanciaDetenidaPayload>(
-      PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+      PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID,
+      { history: 500 }
     );
     await esperarBackfillDe(PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID, detenidasChannel);
 
@@ -167,8 +174,12 @@ export async function iniciarSimulacionServidor(
   // /ambulance-watch) puede enterarse de que esta ambulancia existe. `tipo: "viaje"` (issue
   // #20/#22) distingue esto de una unidad de flota (`lib/tick/flota.ts`) — el cliente lo usa
   // para no ofrecer "Fin de turno" en un viaje efímero, que no tiene ese concepto.
+  // `history: 500` explícito acá también — `obtenerCanalServidor` cachea por channelId, así que
+  // si esta acquisition (solo-escritura) ganara la carrera contra `reconciliarSimulacionesHuerfanas`
+  // (que ya la pide arriba), el resto del proceso quedaría pegado al default de 50 del SDK.
   const registroChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
-    PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
+    PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+    { history: 500 }
   );
   await registroChannel.send({ content: { ambulanceId, tipo: "viaje" } });
 
@@ -244,7 +255,8 @@ export async function detenerSimulacionServidor(ambulanceId: string): Promise<vo
   // A pedido del usuario: avisar a TODOS los observadores (no solo a quien la detuvo) para que
   // le quiten el marker de inmediato, en vez de dejarlo congelado hasta que alguien recargue.
   const detenidasChannel = await obtenerCanalServidor<AmbulanciaDetenidaPayload>(
-    PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+    PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID,
+    { history: 500 }
   );
   await detenidasChannel.send({ content: { ambulanceId } });
 }

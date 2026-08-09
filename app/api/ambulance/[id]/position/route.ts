@@ -70,8 +70,11 @@ async function resolverPrimeraPosicion(
   // /ambulance-watch) puede enterarse de que esta ambulancia existe. `tipo: "viaje"` (issue
   // #20/#22): una ambulancia GPS real se autoasigna un destino al prenderse, sin pasar por
   // flota (A9, fuera de alcance) — no tiene concepto de "libre" para ofrecer "Fin de turno".
+  // `history: 500` explícito — ver la nota en `lib/tick/flota.ts`/`simulacion.ts` sobre el
+  // default de 50 del SDK y la carrera de opciones por el cache de `obtenerCanalServidor`.
   const registroChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
-    PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
+    PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+    { history: 500 }
   );
   await registroChannel.send({ content: { ambulanceId, tipo: "viaje" } });
 

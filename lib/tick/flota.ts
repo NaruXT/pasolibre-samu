@@ -165,8 +165,13 @@ export async function darDeAltaUnidadFlota(ambulanceId: string, origen: LngLat):
   });
 
   try {
+    // `history: 500` explícito — bug real encontrado post-#23 (13 ambulancias fantasma nunca
+    // reconciliadas): el default del SDK sin esta opción es 50, y `obtenerCanalServidor` cachea
+    // por channelId, así que cualquier acquisition sin esta opción que gane la carrera contra
+    // `reconciliarSimulacionesHuerfanas` deja el resto del proceso pegado al default.
     const registroChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
-      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
+      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+      { history: 500 }
     );
     await registroChannel.send({ content: { ambulanceId, tipo: "flota" } });
 
@@ -394,7 +399,8 @@ export async function detenerUnidadFlota(ambulanceId: string): Promise<void> {
   // y la unidad quedaría huérfana para siempre: exactamente la categoría de bug que esta feature
   // existe para eliminar.
   const detenidasChannel = await obtenerCanalServidor<AmbulanciaDetenidaPayload>(
-    PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+    PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID,
+    { history: 500 }
   );
   await detenidasChannel.send({ content: { ambulanceId } });
 
