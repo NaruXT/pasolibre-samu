@@ -2,9 +2,9 @@ import type { LineString } from "geojson";
 import type { LngLat } from "@/lib/mapbox/directions";
 import type { AmbulancePosition } from "@/lib/mapbox/ambulance";
 
-/** Publicado una sola vez por trayecto a PORTAL_ROUTE_CHANNEL_ID. */
+/** Publicado una sola vez por trayecto al canal `rutaAmbulanciaChannelId(ambulanceId)` de esta ambulancia. */
 export interface RoutePublishPayload {
-  /** Identidad de trayecto (issue #12/#14) — distingue ambulancias simultáneas en el canal compartido. */
+  /** Identidad de trayecto (issue #12/#14) — también codificada en el nombre del canal (issue #15), pero se mantiene acá para que el mensaje sea autodescriptivo. */
   ambulanceId: string;
   geometry: LineString;
   distanceMeters: number;
@@ -13,7 +13,12 @@ export interface RoutePublishPayload {
   destination: LngLat;
 }
 
-/** Publicado como ephemeral en cada tick de la ambulancia a PORTAL_AMBULANCE_CHANNEL_ID. */
+/** Publicado como ephemeral en cada tick al canal `ambulanciaChannelId(ambulanceId)` de esta ambulancia. */
 export interface AmbulancePositionPayload extends AmbulancePosition {
+  ambulanceId: string;
+}
+
+/** Publicado una vez a PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID cuando una ambulancia arranca (issue #15) — anuncio de descubrimiento, no lleva más datos que el id. */
+export interface AmbulanciaActivaPayload {
   ambulanceId: string;
 }

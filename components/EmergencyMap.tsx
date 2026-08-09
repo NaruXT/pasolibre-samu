@@ -4,11 +4,20 @@ import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { Feature, LineString } from "geojson";
-import { fetchDrivingRoute, type DrivingRoute, type RouteState } from "@/lib/mapbox/directions";
+import type { ChannelHandle } from "@portalsdk/core";
+import { fetchDrivingRoute, type DrivingRoute, type LngLat, type RouteState } from "@/lib/mapbox/directions";
 import { ambulancePositionAt, type AmbulancePosition } from "@/lib/mapbox/ambulance";
 import { portalClient } from "@/lib/portal/client";
-import { PORTAL_AMBULANCE_CHANNEL_ID, PORTAL_ROUTE_CHANNEL_ID } from "@/lib/portal/constants";
-import type { AmbulancePositionPayload, RoutePublishPayload } from "@/lib/portal/messages";
+import {
+  ambulanciaChannelId,
+  PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+  rutaAmbulanciaChannelId,
+} from "@/lib/portal/constants";
+import type {
+  AmbulanciaActivaPayload,
+  AmbulancePositionPayload,
+  RoutePublishPayload,
+} from "@/lib/portal/messages";
 import { SemaforosCorredor } from "@/components/SemaforosCorredor";
 import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBorjaYColindantes";
 import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
@@ -62,6 +71,10 @@ interface AmbulanceInstance {
   route: DrivingRoute;
   semaforosPendientes: SemaforoEnRuta[];
   velocidadMetrosPorSegundo: number;
+  // Issue #12/#15: canal Portal real y propio de esta ambulancia (no uno compartido) — se
+  // adquiere al arrancar la instancia y se libera al detenerla.
+  routeChannel: ChannelHandle<RoutePublishPayload>;
+  ambulanceChannel: ChannelHandle<AmbulancePositionPayload>;
 }
 
 interface EmergencyMapProps {
@@ -125,14 +138,20 @@ export function EmergencyMap({
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
-    const routeChannel = portalClient.channel<RoutePublishPayload>(PORTAL_ROUTE_CHANNEL_ID);
-    const ambulanceChannel = portalClient.channel<AmbulancePositionPayload>(
-      PORTAL_AMBULANCE_CHANNEL_ID
+    // Issue #12/#15: canal fijo de descubrimiento — cada ambulancia anuncia acá su propio id al
+    // arrancar, para que un watcher (ej. /ambulance-watch) sepa qué canales por-ambulancia
+    // suscribir dinámicamente. Los canales de ruta/posición en sí ya no son compartidos (ver
+    // AmbulanceInstance) — cada ambulancia adquiere los suyos en `iniciarAmbulancia`.
+    const ambulanciasActivasChannel = portalClient.channel<AmbulanciaActivaPayload>(
+      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
     );
-    routeChannel.acquire();
-    ambulanceChannel.acquire();
+    ambulanciasActivasChannel.acquire();
 
-    const publishAmbulancePosition = (ambulanceId: string, position: AmbulancePosition) => {
+    const publishAmbulancePosition = (
+      ambulanceChannel: ChannelHandle<AmbulancePositionPayload>,
+      ambulanceId: string,
+      position: AmbulancePosition
+    ) => {
       ambulanceChannel
         .send({ content: { ...position, ambulanceId }, ephemeral: true })
         .catch((error) => {
@@ -201,6 +220,8 @@ export function EmergencyMap({
       if (!instancia) return;
       if (instancia.timer !== null) clearInterval(instancia.timer);
       instancia.marker.remove();
+      instancia.routeChannel.release();
+      instancia.ambulanceChannel.release();
       ambulanceInstancesRef.current.delete(id);
     };
 
@@ -214,8 +235,42 @@ export function EmergencyMap({
     const iniciarAmbulancia = (
       ambulanceId: string,
       route: DrivingRoute,
+      origin: LngLat,
+      destination: LngLat,
       semaforosPendientes: SemaforoEnRuta[]
     ) => {
+      // Issue #12/#15: canal Portal real y propio de esta ambulancia, no uno compartido.
+      const routeChannel = portalClient.channel<RoutePublishPayload>(
+        rutaAmbulanciaChannelId(ambulanceId)
+      );
+      const ambulanceChannel = portalClient.channel<AmbulancePositionPayload>(
+        ambulanciaChannelId(ambulanceId)
+      );
+      routeChannel.acquire();
+      ambulanceChannel.acquire();
+
+      ambulanciasActivasChannel.send({ content: { ambulanceId } }).catch((error) => {
+        console.error("No se pudo anunciar la ambulancia en Portal:", error);
+      });
+
+      // El propio canal de ruta de esta ambulancia lleva su geometría/metadata (no la ruta de
+      // tráfico que se muestra) para que un suscriptor coincida exactamente con las
+      // actualizaciones de posición en su canal de posición.
+      routeChannel
+        .send({
+          content: {
+            ambulanceId,
+            geometry: route.geometry,
+            distanceMeters: route.distanceMeters,
+            durationSeconds: route.durationSeconds,
+            origin,
+            destination,
+          },
+        })
+        .catch((error) => {
+          console.error("No se pudo publicar la ruta en Portal:", error);
+        });
+
       const velocidadMetrosPorSegundo = route.distanceMeters / route.durationSeconds;
       const posicionInicial = ambulancePositionAt(route, 0);
       const marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
@@ -230,11 +285,13 @@ export function EmergencyMap({
         route,
         semaforosPendientes,
         velocidadMetrosPorSegundo,
+        routeChannel,
+        ambulanceChannel,
       };
       ambulanceInstancesRef.current.set(ambulanceId, instancia);
       recalcularSemaforosVisibles();
 
-      publishAmbulancePosition(ambulanceId, posicionInicial);
+      publishAmbulancePosition(ambulanceChannel, ambulanceId, posicionInicial);
       void ejecutarTickOrquestacion(
         ambulanceId,
         posicionInicial,
@@ -248,7 +305,7 @@ export function EmergencyMap({
         instancia.elapsedSeconds += AMBULANCE_TICK_SECONDS;
         const posicion = ambulancePositionAt(route, instancia.elapsedSeconds);
         instancia.marker.setLngLat([posicion.lng, posicion.lat]);
-        publishAmbulancePosition(ambulanceId, posicion);
+        publishAmbulancePosition(ambulanceChannel, ambulanceId, posicion);
         void ejecutarTickOrquestacion(
           ambulanceId,
           posicion,
@@ -374,25 +431,7 @@ export function EmergencyMap({
           );
           if (!esAgregar) setDecisionesPorSemaforo({});
 
-          // ruta-ambulancia-1 lleva la ruta propia de la ambulancia (no la ruta de tráfico que
-          // se muestra) para que la línea de un suscriptor coincida exactamente con las
-          // actualizaciones de posición en ambulancia-1.
-          routeChannel
-            .send({
-              content: {
-                ambulanceId,
-                geometry: ambulanceRoute.geometry,
-                distanceMeters: ambulanceRoute.distanceMeters,
-                durationSeconds: ambulanceRoute.durationSeconds,
-                origin,
-                destination,
-              },
-            })
-            .catch((error) => {
-              console.error("No se pudo publicar la ruta en Portal:", error);
-            });
-
-          iniciarAmbulancia(ambulanceId, ambulanceRoute, semaforosDeLaRuta);
+          iniciarAmbulancia(ambulanceId, ambulanceRoute, origin, destination, semaforosDeLaRuta);
         } catch (error) {
           if (!mountedRef.current || !sigueVigente()) return;
 
@@ -413,8 +452,7 @@ export function EmergencyMap({
       detenerTodasLasInstancias();
       markerRef.current?.remove();
       map.remove();
-      routeChannel.release();
-      ambulanceChannel.release();
+      ambulanciasActivasChannel.release();
       setLoadedMap(null);
     };
   }, [onEmergencyPointChange, onRouteStateChange, onDestinationChange]);
