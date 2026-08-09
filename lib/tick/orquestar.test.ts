@@ -34,6 +34,27 @@ const SEMAFORO_LEJOS = { semaforoId: "sem-lejos", lng: -77.0, lat: -11.0 }; // ~
 const AMBULANCIA_CERCA = { lng: -77.0, lat: -12.0, velocidadMetrosPorSegundo: 10 };
 const SEMAFORO_CERCA = { semaforoId: "sem-cerca", lng: -77.0, lat: -12.0 + 0.0009 };
 
+// ~33m de SEMAFORO_CERCA (0.0003° de latitud) — dentro del radio de intersección de 50m.
+const SEMAFORO_VECINO = { semaforoId: "sem-vecino", lng: -77.0, lat: -12.0 + 0.0009 + 0.0003 };
+// ~222m de SEMAFORO_CERCA (0.002°) — fuera del radio de intersección, otra esquina del mapa.
+const SEMAFORO_NO_VECINO = { semaforoId: "sem-no-vecino", lng: -77.0, lat: -12.0 + 0.0009 + 0.002 };
+
+// Separación real medida con turf: 594.97m (ETA≈59.5s, dentro de la ventana de decisión) y
+// 629.98m (ETA≈63.0s, todavía fuera de SU PROPIA ventana), separados 35.0m entre sí (dentro del
+// radio de intersección de 50m) — modela el caso real: el vecino integra el corredor de
+// semáforos del trayecto entero (`semaforosEnRuta`, fijo por viaje) desde el principio, pero su
+// propio ETA recién entra en ventana un poco más tarde que el del semáforo que abre primero.
+const SEMAFORO_INTERSECCION_ABIERTO = {
+  semaforoId: "sem-interseccion-abierto",
+  lng: -77.0,
+  lat: -12.0 + 0.0053507,
+};
+const SEMAFORO_INTERSECCION_VECINO_LEJOS = {
+  semaforoId: "sem-interseccion-vecino-lejos",
+  lng: -77.0,
+  lat: -12.0 + 0.0056655,
+};
+
 describe("orquestarTick", () => {
   test("semáforo fuera de la ventana de decisión: no invoca ni publica", async () => {
     const { deps, decisionesPublicadas } = crearDepsFake();
@@ -287,5 +308,153 @@ describe("orquestarTick", () => {
     );
 
     expect(llamadas).toBe(0);
+  });
+
+  describe("salvaguarda de intersección (forzar_rojo_cruce)", () => {
+    test("forzar verde en un semáforo fuerza rojo en un vecino cercano sin decisión propia", async () => {
+      const { deps, decisionesPublicadas } = crearDepsFake();
+      deps.decidirAccion = async (contexto) => ({
+        semaforoId: contexto.semaforoId,
+        accion: "anticipar_verde",
+        explicacion: "Ventana de decisión, sin congestión transversal.",
+      });
+
+      await orquestarTick(
+        {
+          ambulanceId: AMBULANCE_ID,
+          posicionAmbulancia: AMBULANCIA_CERCA,
+          semaforosPendientes: [SEMAFORO_CERCA, SEMAFORO_VECINO],
+        },
+        deps
+      );
+
+      const decisionVecino = decisionesPublicadas.find((d) => d.semaforoId === "sem-vecino");
+      expect(decisionVecino?.accion).toBe("forzar_rojo_cruce");
+      expect(decisionVecino?.ambulanceId).toBe(AMBULANCE_ID);
+    });
+
+    test("un semáforo fuera del radio de intersección no se ve afectado", async () => {
+      const { deps, decisionesPublicadas } = crearDepsFake();
+      deps.decidirAccion = async (contexto) => ({
+        semaforoId: contexto.semaforoId,
+        accion: "anticipar_verde",
+        explicacion: "Ventana de decisión, sin congestión transversal.",
+      });
+
+      await orquestarTick(
+        {
+          ambulanceId: AMBULANCE_ID,
+          posicionAmbulancia: AMBULANCIA_CERCA,
+          semaforosPendientes: [SEMAFORO_CERCA, SEMAFORO_NO_VECINO],
+        },
+        deps
+      );
+
+      // sem-no-vecino sí entra en su propia ventana de decisión (está a ~322m de la ambulancia,
+      // ETA≈32s), así que también recibe una decisión propia — pero nunca forzar_rojo_cruce,
+      // porque no es vecino de sem-cerca.
+      const decisionNoVecino = decisionesPublicadas.find((d) => d.semaforoId === "sem-no-vecino");
+      expect(decisionNoVecino?.accion).not.toBe("forzar_rojo_cruce");
+    });
+
+    test("no pisa a un vecino que ya tiene su propia decisión publicada", async () => {
+      const { deps, decisionesPublicadas } = crearDepsFake({
+        "sem-vecino:amb-1": ["mantener_ciclo"],
+      });
+      deps.decidirAccion = async (contexto) => ({
+        semaforoId: contexto.semaforoId,
+        accion: "anticipar_verde",
+        explicacion: "Ventana de decisión, sin congestión transversal.",
+      });
+
+      await orquestarTick(
+        {
+          ambulanceId: AMBULANCE_ID,
+          posicionAmbulancia: AMBULANCIA_CERCA,
+          semaforosPendientes: [SEMAFORO_CERCA],
+        },
+        deps
+      );
+
+      expect(decisionesPublicadas.find((d) => d.semaforoId === "sem-vecino")).toBeUndefined();
+    });
+
+    test("mantener_ciclo no dispara la salvaguarda de cruce en los vecinos", async () => {
+      const { deps, decisionesPublicadas } = crearDepsFake();
+
+      await orquestarTick(
+        {
+          ambulanceId: AMBULANCE_ID,
+          posicionAmbulancia: AMBULANCIA_CERCA,
+          semaforosPendientes: [SEMAFORO_CERCA, SEMAFORO_VECINO],
+        },
+        deps
+      );
+
+      expect(decisionesPublicadas.every((d) => d.accion !== "forzar_rojo_cruce")).toBe(true);
+    });
+
+    // Deliberadamente en dos ticks, no uno: `publicarDecision` es un POST REST y
+    // `obtenerAccionesPrevias` lee de un canal WebSocket separado que Portal releva de forma
+    // asíncrona (el mismo lag de propagación ya documentado en CLAUDE.md para el caso de ticks
+    // solapados) — nada garantiza que una lectura hecha microsegundos después de una publicación
+    // ya la refleje. Lo que sí es real: 5s después (el siguiente tick), Portal ya la propagó de
+    // sobra. `crearDepsFake` con un fake nuevo sembrado con lo publicado en el tick 1 simula
+    // justamente eso — y de paso evita que el vecino, todavía dentro de su PROPIA ventana de
+    // decisión en el mismo tick, dispare una segunda llamada al LLM en la fake estática (que no
+    // refleja lo recién publicado dentro de la misma llamada a `orquestarTick`).
+    test("un tick posterior ve la salvaguarda ya publicada y no reinvoca al LLM para el vecino", async () => {
+      const { deps: deps1, decisionesPublicadas: publicadasEnTick1 } = crearDepsFake();
+      deps1.decidirAccion = async (contexto) => ({
+        semaforoId: contexto.semaforoId,
+        accion: "extender_verde",
+        explicacion: "Ventana de decisión, sin congestión transversal.",
+      });
+
+      await orquestarTick(
+        {
+          ambulanceId: AMBULANCE_ID,
+          posicionAmbulancia: AMBULANCIA_CERCA,
+          // sem-interseccion-vecino-lejos integra el corredor del trayecto (como en producción,
+          // `semaforosEnRuta` es fijo por viaje) pero su propio ETA (~63s) todavía está fuera de
+          // la ventana de 60s — así que su única decisión en este tick es la salvaguarda de
+          // cruce, no una propia.
+          semaforosPendientes: [SEMAFORO_INTERSECCION_ABIERTO, SEMAFORO_INTERSECCION_VECINO_LEJOS],
+        },
+        deps1
+      );
+
+      const decisionVecinoTick1 = publicadasEnTick1.find(
+        (d) => d.semaforoId === "sem-interseccion-vecino-lejos"
+      );
+      expect(decisionVecinoTick1?.accion).toBe("forzar_rojo_cruce");
+
+      // Tick siguiente: la ambulancia ya está más cerca, el vecino ahora sí entra en su propia
+      // ventana de decisión — pero no debe reinvocar al LLM, porque Portal ya propagó la
+      // salvaguarda del tick anterior.
+      let llamadasLLM = 0;
+      const { deps: deps2 } = crearDepsFake({
+        "sem-interseccion-vecino-lejos:amb-1": ["forzar_rojo_cruce"],
+      });
+      deps2.decidirAccion = async (contexto) => {
+        llamadasLLM++;
+        return { semaforoId: contexto.semaforoId, accion: "mantener_ciclo", explicacion: "" };
+      };
+
+      const resultados2 = await orquestarTick(
+        {
+          ambulanceId: AMBULANCE_ID,
+          posicionAmbulancia: AMBULANCIA_CERCA,
+          semaforosPendientes: [SEMAFORO_INTERSECCION_VECINO_LEJOS],
+        },
+        deps2
+      );
+
+      expect(llamadasLLM).toBe(0);
+      expect(resultados2[0]?.fase).toEqual({ fase: "rojo", segundosRestantes: Infinity });
+      // La salvaguarda es mecánica, no una decisión del agente — el vecino no reinvoca al LLM,
+      // así que su propio `decision` en el resultado queda null.
+      expect(resultados2[0]?.decision).toBeNull();
+    });
   });
 });

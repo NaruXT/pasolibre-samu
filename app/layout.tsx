@@ -3,6 +3,15 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { PortalProviderClient } from "@/components/PortalProviderClient";
 
+/**
+ * Toda la app depende de Portal/Mapbox en vivo — nada acá se beneficia de un prerender estático,
+ * y forzarlo evita que `next build` ejecute `PortalProviderClient` (y transitivamente
+ * `lib/portal/client.ts`, que valida `NEXT_PUBLIC_PORTAL_API_KEY`) durante la generación de
+ * páginas estáticas, donde las env vars de runtime pueden no estar disponibles todavía
+ * (reproducido en vivo desplegando a Railway).
+ */
+export const dynamic = "force-dynamic";
+
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],

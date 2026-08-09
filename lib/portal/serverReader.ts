@@ -9,13 +9,22 @@ if (typeof globalThis.WebSocket === "undefined") {
   globalThis.WebSocket = NodeWebSocket as unknown as typeof WebSocket;
 }
 
-const apiKeyEnv = process.env.NEXT_PUBLIC_PORTAL_API_KEY;
-if (!apiKeyEnv) {
-  throw new Error("NEXT_PUBLIC_PORTAL_API_KEY is not set. Add it to .env (see .env.example).");
+/**
+ * Leída y validada recién en el primer uso real (dentro de `obtenerPortalReader`), no a nivel de
+ * módulo — `next build` importa las rutas de `app/api/*` para recolectar su configuración
+ * (`generateStaticParams`, etc.) aunque nunca lleguen a invocarse, así que un throw a nivel de
+ * módulo tumba el build entero si la env var no está presente en el entorno de *build*, aunque sí
+ * vaya a estarlo en runtime. Reproducido en vivo desplegando a Railway: "Failed to collect
+ * configuration for /api/fleet/[id]/enroll" → el import transitivo de este archivo alcanza a
+ * cualquier ruta que use `lib/tick/simulacion.ts`, sin que la ruta se ejecute nunca durante el build.
+ */
+function obtenerApiKey(): string {
+  const apiKeyEnv = process.env.NEXT_PUBLIC_PORTAL_API_KEY;
+  if (!apiKeyEnv) {
+    throw new Error("NEXT_PUBLIC_PORTAL_API_KEY is not set. Add it to .env (see .env.example).");
+  }
+  return apiKeyEnv;
 }
-// Reasignado a una const de tipo `string`: el narrowing del guard de arriba no sobrevive
-// dentro de la función más abajo, que TypeScript trata como un closure diferido.
-const apiKey: string = apiKeyEnv;
 
 // Cacheado en globalThis para sobrevivir al HMR de Next.js en dev — evita abrir una conexión
 // WebSocket nueva cada vez que este módulo se recarga (ver CLAUDE.md, ticket #7). Issue #12/#16:
@@ -29,7 +38,7 @@ const cachePortal = globalThis as unknown as {
 
 function obtenerPortalReader(): Portal {
   if (!cachePortal.__portalServerReader) {
-    cachePortal.__portalServerReader = new Portal({ apiKey });
+    cachePortal.__portalServerReader = new Portal({ apiKey: obtenerApiKey() });
   }
   return cachePortal.__portalServerReader;
 }

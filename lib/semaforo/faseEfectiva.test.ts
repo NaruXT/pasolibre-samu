@@ -30,4 +30,24 @@ describe("faseEfectiva", () => {
       segundosRestantes: 30,
     });
   });
+
+  // offset("A")=23 (ver fase.test.ts) → t=10 da tiempoEnCiclo=33 → físicamente verde — la
+  // salvaguarda de cruce debe forzar rojo de todas formas, para no dejar pasar tránsito
+  // transversal mientras el vecino de esta intersección está abierto para la ambulancia.
+  test("un forzar_rojo_cruce fuerza rojo aunque el ciclo físico esté en verde", () => {
+    expect(faseEfectiva("A", 10, ["forzar_rojo_cruce"])).toEqual({
+      fase: "rojo",
+      segundosRestantes: Infinity,
+    });
+  });
+
+  // En la práctica nunca coexisten (una sola decisión publicada por semáforo por trayecto, ver
+  // orquestar.ts) pero de coexistir, el verde propio gana — una ambulancia con decisión directa
+  // para este semáforo nunca debe quedar bloqueada por la protección de cruce de un vecino.
+  test("un verde propio gana sobre un forzar_rojo_cruce si ambos coexistieran", () => {
+    expect(faseEfectiva("Z", 45, ["forzar_rojo_cruce", "anticipar_verde"])).toEqual({
+      fase: "verde",
+      segundosRestantes: Infinity,
+    });
+  });
 });
