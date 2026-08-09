@@ -11,11 +11,13 @@ import { portalClient } from "@/lib/portal/client";
 import {
   ambulanciaChannelId,
   PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+  PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID,
   PORTAL_SEMAFOROS_CHANNEL_ID,
   rutaAmbulanciaChannelId,
 } from "@/lib/portal/constants";
 import type {
   AmbulanciaActivaPayload,
+  AmbulanciaDetenidaPayload,
   AmbulancePositionPayload,
   RoutePublishPayload,
 } from "@/lib/portal/messages";
@@ -36,6 +38,10 @@ const CORRIDOR_START: [number, number] = [-76.9973, -12.0905];
 const ROUTE_SOURCE_ID = "emergency-route";
 const ROUTE_LAYER_ID = "emergency-route-line";
 const EMPTY_ROUTE_GEOMETRY: LineString = { type: "LineString", coordinates: [] };
+
+// A pedido del usuario: sin esto, una ambulancia que llega a destino queda congelada en el mapa
+// para siempre (nadie la remueve) — se ve el marker "llegar" un momento y después desaparece.
+const TIEMPO_VISIBLE_TRAS_LLEGAR_MS = 4000;
 
 function toRouteFeature(geometry: LineString): Feature<LineString> {
   return { type: "Feature", properties: {}, geometry };
@@ -98,6 +104,11 @@ export function EmergencyMap({
   // intente observar dos veces la misma ambulancia (su propio anuncio le puede volver a este
   // mismo cliente por el mismo canal).
   const idsConocidosRef = useRef<Set<string>>(new Set());
+  // Post-slice #16, a pedido del usuario: ids que ya sabemos detenidos (vía
+  // ambulancias-detenidas) — evita observar (o mantener visible) una ambulancia que el
+  // servidor ya dejó de mover, sin importar el orden en que lleguen los mensajes de los dos
+  // canales de descubrimiento/detención (ver el listener más abajo).
+  const idsDetenidosRef = useRef<Set<string>>(new Set());
   // Post-slice #16: ids de simulaciones que ESTE cliente arrancó (vía POST a
   // /api/ambulance/[id]/simulate) — a diferencia de las meramente observadas (creadas por otra
   // pestaña, o reales), este cliente es responsable de pedirle al servidor que las detenga al
@@ -196,6 +207,18 @@ export function EmergencyMap({
     const cancelarDecisiones = decisionesChannel.subscribe(procesarDecisiones);
     procesarDecisiones();
 
+    // A pedido del usuario: canal de "detención" — cuando el servidor para una simulación
+    // explícitamente (reset o pagehide de la pestaña que la arrancó), avisa acá para que TODOS
+    // los observadores le quiten el marker de inmediato, no solo quien la detuvo. Declarado
+    // antes de `detenerInstancia`/`observarAmbulancia` (definidos más abajo) porque su handler
+    // los referencia — JS los resuelve igual al ejecutarse (son funciones, no valores), así que
+    // el orden de declaración acá no importa en la práctica, pero el de *invocación* sí: el
+    // `.subscribe()` real ocurre recién después de que ambas estén definidas.
+    const ambulanciasDetenidasChannel = portalClient.channel<AmbulanciaDetenidaPayload>(
+      PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+    );
+    ambulanciasDetenidasChannel.acquire();
+
     // Unión deduplicada (por semaforoId) de los corredores filtrados de todas las instancias
     // activas — el marcador en el mapa es uno por ubicación física, no uno por ambulancia.
     const recalcularSemaforosVisibles = () => {
@@ -223,6 +246,23 @@ export function EmergencyMap({
       for (const id of [...ambulanceInstancesRef.current.keys()]) detenerInstancia(id);
       recalcularSemaforosVisibles();
     };
+
+    // Reacciona a `ambulancias-detenidas` (backfill + en vivo, mismo patrón que el registro):
+    // marca el id como detenido (para que `observarAmbulancia` nunca lo observe si el aviso
+    // llegó antes que su anuncio) y, si ya estaba visible, lo remueve ahora mismo.
+    const procesarDetenciones = () => {
+      if (!mountedRef.current) return;
+      for (const msg of ambulanciasDetenidasChannel.messages) {
+        const { ambulanceId } = msg.content;
+        idsDetenidosRef.current.add(ambulanceId);
+        if (ambulanceInstancesRef.current.has(ambulanceId)) {
+          detenerInstancia(ambulanceId);
+          recalcularSemaforosVisibles();
+        }
+      }
+    };
+    const cancelarDetenciones = ambulanciasDetenidasChannel.subscribe(procesarDetenciones);
+    procesarDetenciones();
 
     // Issue #12/#16: espera al primer mensaje ya publicado de `canal` — NO alcanza con esperar
     // `status === "ready"` (descubierto en vivo probando este mismo slice): el backfill de
@@ -262,7 +302,9 @@ export function EmergencyMap({
     // `/api/ambulance/[id]/simulate` (ver el click handler más abajo); una vez que el servidor
     // publica la ruta + el anuncio, esta misma función la recoge igual que a cualquier otra.
     const observarAmbulancia = async (ambulanceId: string) => {
-      if (idsConocidosRef.current.has(ambulanceId)) return;
+      if (idsConocidosRef.current.has(ambulanceId) || idsDetenidosRef.current.has(ambulanceId)) {
+        return;
+      }
       idsConocidosRef.current.add(ambulanceId);
 
       const routeChannel = portalClient.channel<RoutePublishPayload>(
@@ -294,6 +336,15 @@ export function EmergencyMap({
       const fuente: PosicionSource = new RealPosicionSource(ambulanceChannel);
       const detenerFuente = fuente.suscribir((posicion) => {
         marker.setLngLat([posicion.lng, posicion.lat]);
+        // A pedido del usuario: al llegar, se ve un momento en el destino y después se quita
+        // sola — si no, queda congelada en el mapa para siempre (nadie más la remueve).
+        if (posicion.arrived) {
+          setTimeout(() => {
+            if (!mountedRef.current) return;
+            detenerInstancia(ambulanceId);
+            recalcularSemaforosVisibles();
+          }, TIEMPO_VISIBLE_TRAS_LLEGAR_MS);
+        }
       });
 
       ambulanceInstancesRef.current.set(ambulanceId, {
@@ -453,11 +504,13 @@ export function EmergencyMap({
       misSimulaciones.clear();
       cancelarAnuncios();
       cancelarDecisiones();
+      cancelarDetenciones();
       detenerTodasLasInstancias();
       markerRef.current?.remove();
       map.remove();
       ambulanciasActivasChannel.release();
       decisionesChannel.release();
+      ambulanciasDetenidasChannel.release();
       setLoadedMap(null);
     };
   }, [onEmergencyPointChange, onRouteStateChange, onDestinationChange]);

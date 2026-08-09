@@ -30,5 +30,16 @@ export function ambulanciaChannelId(ambulanceId: string): string {
  */
 export const PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID = "ambulancias-activas";
 
+/**
+ * Canal de "detención" (post-slice #16, a pedido del usuario): cuando el servidor detiene una
+ * simulación explícitamente (reset por click o `pagehide` de la pestaña que la arrancó — ver
+ * `detenerSimulacionServidor`), publica acá para que TODOS los observadores (no solo quien la
+ * detuvo) le quiten el marker de inmediato. Una llegada natural a destino NO publica acá — ya
+ * se comunica sola vía `arrived: true` en el propio canal de posición; este canal es solo para
+ * el caso que ningún observador podría inferir por su cuenta (el servidor dejó de moverla, pero
+ * seguiría "viva" en pantalla para siempre sin este aviso).
+ */
+export const PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID = "ambulancias-detenidas";
+
 /** Servidor, REST, no ephemeral — decisiones del agente (mock en el ticket #7) por semáforo. */
 export const PORTAL_SEMAFOROS_CHANNEL_ID = "semaforos-ruta-1";

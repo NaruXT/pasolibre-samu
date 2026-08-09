@@ -37,6 +37,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 /** Detiene una simulación activa — no-op si ya llegó o nunca existió. */
 export async function DELETE(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id: ambulanceId } = await params;
-  detenerSimulacionServidor(ambulanceId);
+  try {
+    await detenerSimulacionServidor(ambulanceId);
+  } catch (error) {
+    console.error(`Error deteniendo la simulación ${ambulanceId}:`, error);
+  }
   return NextResponse.json({ ok: true });
 }

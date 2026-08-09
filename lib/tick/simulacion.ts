@@ -8,10 +8,12 @@ import { obtenerCanalServidor } from "@/lib/portal/serverReader";
 import {
   ambulanciaChannelId,
   PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+  PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID,
   rutaAmbulanciaChannelId,
 } from "@/lib/portal/constants";
 import type {
   AmbulanciaActivaPayload,
+  AmbulanciaDetenidaPayload,
   AmbulancePositionPayload,
   RoutePublishPayload,
 } from "@/lib/portal/messages";
@@ -154,11 +156,19 @@ export async function iniciarSimulacionServidor(
  * Detiene una simulación activa — a pedido del usuario, resetear el mapa (nueva emergencia)
  * también para la simulación en el servidor, no solo deja de observarla en un cliente. Sin
  * efecto (no-op) si `ambulanceId` no tiene una simulación corriendo, sea porque ya llegó o
- * porque nunca existió.
+ * porque nunca existió — en ese caso no se publica nada (una llegada natural ya se comunicó
+ * sola vía `arrived: true`, y no hay nada que avisar si el id nunca existió).
  */
-export function detenerSimulacionServidor(ambulanceId: string): void {
+export async function detenerSimulacionServidor(ambulanceId: string): Promise<void> {
   const simulacion = cacheSimulaciones.__simulacionesActivas?.get(ambulanceId);
   if (!simulacion) return;
   simulacion.detener();
   cacheSimulaciones.__simulacionesActivas!.delete(ambulanceId);
+
+  // A pedido del usuario: avisar a TODOS los observadores (no solo a quien la detuvo) para que
+  // le quiten el marker de inmediato, en vez de dejarlo congelado hasta que alguien recargue.
+  const detenidasChannel = await obtenerCanalServidor<AmbulanciaDetenidaPayload>(
+    PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+  );
+  await detenidasChannel.send({ content: { ambulanceId } });
 }

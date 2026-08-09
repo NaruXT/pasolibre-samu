@@ -22,3 +22,8 @@ export interface AmbulancePositionPayload extends AmbulancePosition {
 export interface AmbulanciaActivaPayload {
   ambulanceId: string;
 }
+
+/** Publicado una vez a PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID cuando el servidor detiene una simulación explícitamente (post-slice #16) — ver la nota del canal en `lib/portal/constants.ts`. */
+export interface AmbulanciaDetenidaPayload {
+  ambulanceId: string;
+}
