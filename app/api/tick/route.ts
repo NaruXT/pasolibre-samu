@@ -22,7 +22,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const resultados = await orquestarTick(input, crearOrquestarTickDepsReales());
+    const resultados = await orquestarTick(input, crearOrquestarTickDepsReales("api-tick-legacy"));
     return NextResponse.json({ resultados });
   } catch (error) {
     console.error("Error orquestando el tick:", error);

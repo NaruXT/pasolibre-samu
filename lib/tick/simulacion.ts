@@ -169,9 +169,21 @@ export async function iniciarSimulacionServidor(
     ambulanciaChannelId(ambulanceId)
   );
   const velocidadMetrosPorSegundo = ruta.distanceMeters / ruta.durationSeconds;
-  const depsOrquestacion = crearOrquestarTickDepsReales();
+  const depsOrquestacion = crearOrquestarTickDepsReales("simulacion");
 
   const fuente = new InterpoladaPosicionSource(ruta);
+  // Guardia de tick-en-curso (skill `cost-audit`, 2026-08-08) — bug real confirmado con datos:
+  // con ~11 semáforos por trayecto, una sola pasada de `orquestarTick` (I/O secuencial por
+  // semáforo: lectura Portal + posible llamada LLM + TomTom + publish) puede tardar más que los
+  // 5s entre ticks de posición. Sin esta guardia, `void orquestarTick(...)` deja el tick anterior
+  // corriendo en paralelo con el siguiente — dos invocaciones concurrentes leen "sin decisión
+  // previa" para el mismo semáforo (la publicación REST del primero no llegó a tiempo a la
+  // lectura WS del segundo) y ambas llaman al LLM. Verificado en vivo: 31 llamadas reales para
+  // 11 semáforos únicos en un solo trayecto (64.5% de las llamadas eran reprocesamiento puro).
+  // El tick que se salta NO se encola — la posición se sigue publicando cada 5s sin importar
+  // esto, solo se throttlea el efecto de `orquestarTick`; el próximo tick libre retoma cualquier
+  // semáforo que siga pendiente.
+  let tickEnCurso = false;
   const detener = fuente.suscribir((posicion) => {
     void ambulanceChannel
       .send({ content: { ...posicion, ambulanceId }, ephemeral: true })
@@ -179,7 +191,8 @@ export async function iniciarSimulacionServidor(
         console.error(`No se pudo publicar posición de la simulación ${ambulanceId}:`, error);
       });
 
-    if (semaforosPendientes.length > 0) {
+    if (semaforosPendientes.length > 0 && !tickEnCurso) {
+      tickEnCurso = true;
       void orquestarTick(
         {
           ambulanceId,
@@ -187,9 +200,13 @@ export async function iniciarSimulacionServidor(
           semaforosPendientes,
         },
         depsOrquestacion
-      ).catch((error) => {
-        console.error(`Error orquestando tick de la simulación ${ambulanceId}:`, error);
-      });
+      )
+        .catch((error) => {
+          console.error(`Error orquestando tick de la simulación ${ambulanceId}:`, error);
+        })
+        .finally(() => {
+          tickEnCurso = false;
+        });
     }
 
     if (posicion.arrived) {

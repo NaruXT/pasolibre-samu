@@ -37,6 +37,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# log local de costo del LLM (skill cost-audit) — datos de runtime, no código
+/.data/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

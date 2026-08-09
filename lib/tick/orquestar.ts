@@ -94,6 +94,7 @@ export async function orquestarTick(
         etaSegundos,
         fase: faseAntesDeDecidir,
         congestionTransversal,
+        ambulanceId: input.ambulanceId,
       });
       await deps.publicarDecision({ ...decision, ambulanceId: input.ambulanceId });
       accionesPrevias.push(decision.accion);

@@ -137,7 +137,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           posicionAmbulancia: { lng: body.lng, lat: body.lat, velocidadMetrosPorSegundo },
           semaforosPendientes: estado.semaforosPendientes,
         },
-        crearOrquestarTickDepsReales()
+        crearOrquestarTickDepsReales("gps-real")
       );
     }
 
