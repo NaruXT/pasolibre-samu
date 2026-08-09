@@ -12,14 +12,17 @@ import type { AmbulancePositionPayload, RoutePublishPayload } from "@/lib/portal
 import { SemaforosCorredor } from "@/components/SemaforosCorredor";
 import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBorjaYColindantes";
 import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
+import { hospitalMasCercano } from "@/lib/hospital/hospitalMasCercano";
+import { HOSPITALES_SAN_BORJA_Y_COLINDANTES } from "@/lib/hospital/hospitalesSanBorjaYColindantes";
 import type { DecisionSemaforo } from "@/lib/tick/decision";
 import type { ResultadoSemaforo } from "@/lib/tick/orquestar";
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
-// Corredor Av. Javier Prado (San Borja) -> Hospital Nacional Edgardo Rebagliati Martins.
-const CORRIDOR_START: [number, number] = [-76.9973, -12.0905]; // Av. Javier Prado Este x Av. Aviación, San Borja
-const REBAGLIATI: [number, number] = [-77.0399, -12.0784]; // Destino fijo (ver CLAUDE.md)
+// Punto de partida del corredor de referencia (Av. Javier Prado Este x Av. Aviación, San Borja)
+// — solo se usa para el encuadre inicial del mapa. El destino ya no es fijo (issue #12): se
+// calcula por hospital más cercano en tiempo real a partir del punto de emergencia elegido.
+const CORRIDOR_START: [number, number] = [-76.9973, -12.0905];
 
 const ROUTE_SOURCE_ID = "emergency-route";
 const ROUTE_LAYER_ID = "emergency-route-line";
@@ -45,12 +48,23 @@ export interface EmergencyPoint {
   lat: number;
 }
 
+export interface HospitalDestino {
+  nombre: string;
+  lng: number;
+  lat: number;
+}
+
 interface EmergencyMapProps {
   onEmergencyPointChange: (point: EmergencyPoint | null) => void;
   onRouteStateChange: (state: RouteState) => void;
+  onDestinationChange?: (destino: HospitalDestino | null) => void;
 }
 
-export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: EmergencyMapProps) {
+export function EmergencyMap({
+  onEmergencyPointChange,
+  onRouteStateChange,
+  onDestinationChange,
+}: EmergencyMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const markerRef = useRef<mapboxgl.Marker | null>(null);
   const requestIdRef = useRef(0);
@@ -74,9 +88,13 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
     if (!containerRef.current || !MAPBOX_TOKEN) return;
 
     mapboxgl.accessToken = MAPBOX_TOKEN;
-    const corridorBounds = new mapboxgl.LngLatBounds()
-      .extend(CORRIDOR_START)
-      .extend(REBAGLIATI);
+    // Sin destino fijo, el encuadre inicial cubre el punto de partida de referencia y todo el
+    // dataset de hospitales (mismos 7 distritos que el dataset de semáforos, ticket #9) en vez
+    // de un único punto fijo.
+    const corridorBounds = HOSPITALES_SAN_BORJA_Y_COLINDANTES.reduce(
+      (bounds, hospital) => bounds.extend([hospital.lng, hospital.lat]),
+      new mapboxgl.LngLatBounds().extend(CORRIDOR_START)
+    );
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/streets-v12",
@@ -226,15 +244,29 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
 
         try {
           const origin = { lng, lat };
-          const destination = { lng: REBAGLIATI[0], lat: REBAGLIATI[1] };
           const fetchOptions = { signal: abortController.signal };
-          // Dos fetches separados a propósito: la ruta/ETA dibujada refleja tráfico real (lo que
+
+          // Hospital más cercano por duración de ruta real (issue #12), no línea recta ni un
+          // destino fijo — sin excluir ninguno por especialidad. La ruta "driving" que gana esta
+          // comparación es directamente `ambulanceRoute`: no hace falta pedirla de nuevo.
+          const hospitalCercano = await hospitalMasCercano(
+            origin,
+            HOSPITALES_SAN_BORJA_Y_COLINDANTES,
+            { obtenerRuta: (o, d) => fetchDrivingRoute(o, d, "driving", fetchOptions) }
+          );
+          if (requestId !== requestIdRef.current) return; // reemplazado por un click posterior
+
+          const destination = { lng: hospitalCercano.lng, lat: hospitalCercano.lat };
+          const ambulanceRoute = hospitalCercano.ruta;
+          onDestinationChange?.({
+            nombre: hospitalCercano.nombre,
+            lng: hospitalCercano.lng,
+            lat: hospitalCercano.lat,
+          });
+          // Fetch separado a propósito: la ruta/ETA dibujada refleja tráfico real (lo que
           // experimentaría un auto normal); el ritmo propio de la ambulancia nunca lo hace
-          // (vehículo con prioridad).
-          const [displayRoute, ambulanceRoute] = await Promise.all([
-            fetchDrivingRoute(origin, destination, "driving-traffic", fetchOptions),
-            fetchDrivingRoute(origin, destination, "driving", fetchOptions),
-          ]);
+          // (vehículo con prioridad) — ver `ambulanceRoute` arriba, perfil "driving" plano.
+          const displayRoute = await fetchDrivingRoute(origin, destination, "driving-traffic", fetchOptions);
           if (requestId !== requestIdRef.current) return; // reemplazado por un click posterior
 
           routeSource()?.setData(toRouteFeature(displayRoute.geometry));
@@ -276,7 +308,8 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
           routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
           const message = error instanceof Error ? error.message : String(error);
           onRouteStateChange({ status: "error", message });
-          console.error("No se pudo calcular la ruta a Rebagliati:", error);
+          onDestinationChange?.(null);
+          console.error("No se pudo calcular la ruta al hospital más cercano:", error);
         }
       });
     });
@@ -290,7 +323,7 @@ export function EmergencyMap({ onEmergencyPointChange, onRouteStateChange }: Eme
       ambulanceChannel.release();
       setLoadedMap(null);
     };
-  }, [onEmergencyPointChange, onRouteStateChange]);
+  }, [onEmergencyPointChange, onRouteStateChange, onDestinationChange]);
 
   if (!MAPBOX_TOKEN) {
     return (
