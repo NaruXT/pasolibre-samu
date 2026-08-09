@@ -1,11 +1,6 @@
 import { NextResponse } from "next/server";
 import { orquestarTick, type OrquestarTickInput } from "@/lib/tick/orquestar";
-import { decidirAccionLLM } from "@/lib/tick/agent";
-import { publishToPortalChannel } from "@/lib/portal/server";
-import { obtenerAccionesPreviasSemaforo } from "@/lib/portal/serverReader";
-import { PORTAL_SEMAFOROS_CHANNEL_ID } from "@/lib/portal/constants";
-import type { DecisionSemaforoPublicada } from "@/lib/tick/decision";
-import { obtenerCongestionTransversal } from "@/lib/tomtom/trafficFlow";
+import { crearOrquestarTickDepsReales } from "@/lib/tick/deps";
 
 export async function POST(request: Request) {
   let input: OrquestarTickInput;
@@ -27,19 +22,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const resultados = await orquestarTick(input, {
-      obtenerAccionesPrevias: obtenerAccionesPreviasSemaforo,
-      decidirAccion: decidirAccionLLM,
-      obtenerCongestionTransversal,
-      publicarDecision: async (decision: DecisionSemaforoPublicada) => {
-        await publishToPortalChannel({
-          channelId: PORTAL_SEMAFOROS_CHANNEL_ID,
-          content: decision,
-          type: "decision-semaforo",
-          senderId: "tick-orchestrator",
-        });
-      },
-    });
+    const resultados = await orquestarTick(input, crearOrquestarTickDepsReales());
     return NextResponse.json({ resultados });
   } catch (error) {
     console.error("Error orquestando el tick:", error);

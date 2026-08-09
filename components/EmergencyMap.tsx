@@ -6,7 +6,12 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import type { Feature, LineString } from "geojson";
 import type { ChannelHandle } from "@portalsdk/core";
 import { fetchDrivingRoute, type DrivingRoute, type LngLat, type RouteState } from "@/lib/mapbox/directions";
-import { ambulancePositionAt, type AmbulancePosition } from "@/lib/mapbox/ambulance";
+import type { AmbulancePosition } from "@/lib/mapbox/ambulance";
+import {
+  InterpoladaPosicionSource,
+  RealPosicionSource,
+  type PosicionSource,
+} from "@/lib/mapbox/posicionSource";
 import { portalClient } from "@/lib/portal/client";
 import {
   ambulanciaChannelId,
@@ -37,9 +42,6 @@ const ROUTE_SOURCE_ID = "emergency-route";
 const ROUTE_LAYER_ID = "emergency-route-line";
 const EMPTY_ROUTE_GEOMETRY: LineString = { type: "LineString", coordinates: [] };
 
-const AMBULANCE_TICK_SECONDS = 5;
-const AMBULANCE_TICK_MS = AMBULANCE_TICK_SECONDS * 1000;
-
 function toRouteFeature(geometry: LineString): Feature<LineString> {
   return { type: "Feature", properties: {}, geometry };
 }
@@ -66,15 +68,16 @@ export interface HospitalDestino {
 interface AmbulanceInstance {
   id: string;
   marker: mapboxgl.Marker;
-  timer: ReturnType<typeof setInterval> | null;
-  elapsedSeconds: number;
-  route: DrivingRoute;
   semaforosPendientes: SemaforoEnRuta[];
-  velocidadMetrosPorSegundo: number;
   // Issue #12/#15: canal Portal real y propio de esta ambulancia (no uno compartido) — se
-  // adquiere al arrancar la instancia y se libera al detenerla.
+  // adquiere al arrancar/observar la instancia y se libera al detenerla.
   routeChannel: ChannelHandle<RoutePublishPayload>;
   ambulanceChannel: ChannelHandle<AmbulancePositionPayload>;
+  // Issue #12/#16: source-agnostic — simulada (timer local, `InterpoladaPosicionSource`) o
+  // real (empujada por Portal, `RealPosicionSource`). Detiene lo que corresponda según la
+  // fuente (clearInterval / cancelar suscripción Portal), sin que este archivo tenga que saber
+  // cuál es.
+  detenerFuente: () => void;
 }
 
 interface EmergencyMapProps {
@@ -97,6 +100,10 @@ export function EmergencyMap({
   // el mapa en modo default sigue reseteando todo (comportamiento original); "Agregar ambulancia"
   // arma un modo de un solo click que suma una instancia sin tocar las existentes.
   const ambulanceInstancesRef = useRef<Map<string, AmbulanceInstance>>(new Map());
+  // Issue #12/#16: ids ya conocidos, propios o remotos — evita que el descubrimiento vía
+  // ambulancias-activas intente "observar como remota" una ambulancia que este mismo cliente
+  // ya creó (su propio anuncio le puede volver por el mismo canal).
+  const idsConocidosRef = useRef<Set<string>>(new Set());
   const modoAgregarRef = useRef(false);
   const mountedRef = useRef(true);
   const [modoAgregarActivo, setModoAgregarActivo] = useState(false);
@@ -218,16 +225,49 @@ export function EmergencyMap({
     const detenerInstancia = (id: string) => {
       const instancia = ambulanceInstancesRef.current.get(id);
       if (!instancia) return;
-      if (instancia.timer !== null) clearInterval(instancia.timer);
+      instancia.detenerFuente();
       instancia.marker.remove();
       instancia.routeChannel.release();
       instancia.ambulanceChannel.release();
       ambulanceInstancesRef.current.delete(id);
+      idsConocidosRef.current.delete(id);
     };
 
     const detenerTodasLasInstancias = () => {
       for (const id of [...ambulanceInstancesRef.current.keys()]) detenerInstancia(id);
       recalcularSemaforosVisibles();
+    };
+
+    // Issue #12/#16: espera al primer mensaje ya publicado de `canal` — NO alcanza con esperar
+    // `status === "ready"` (descubierto en vivo probando este mismo slice): el backfill de
+    // historial llega en un evento posterior, separado, vía `subscribe()` — leer `.messages`
+    // justo cuando el status pasa a "ready" agarra un snapshot todavía vacío. `subscribe()` es
+    // el "useSyncExternalStore-shaped store contract" documentado por el SDK para reaccionar a
+    // cambios en `.messages`, así que re-chequear ahí (en vez de una sola lectura puntual) es la
+    // forma correcta de esperar el backfill.
+    const esperarPrimerMensaje = <M,>(
+      canal: ChannelHandle<M>,
+      timeoutMs = 5000
+    ): Promise<M | undefined> => {
+      const ultimoMensaje = () => canal.messages[canal.messages.length - 1]?.content;
+      const yaDisponible = ultimoMensaje();
+      if (yaDisponible !== undefined) return Promise.resolve(yaDisponible);
+
+      return new Promise((resolve) => {
+        let cancelar: () => void = () => {};
+        const temporizador = setTimeout(() => {
+          cancelar();
+          resolve(undefined);
+        }, timeoutMs);
+        cancelar = canal.subscribe(() => {
+          const mensaje = ultimoMensaje();
+          if (mensaje !== undefined) {
+            clearTimeout(temporizador);
+            cancelar();
+            resolve(mensaje);
+          }
+        });
+      });
     };
 
     // `route` debe venir del perfil "driving" plano — la ambulancia es un vehículo con
@@ -239,6 +279,8 @@ export function EmergencyMap({
       destination: LngLat,
       semaforosPendientes: SemaforoEnRuta[]
     ) => {
+      idsConocidosRef.current.add(ambulanceId);
+
       // Issue #12/#15: canal Portal real y propio de esta ambulancia, no uno compartido.
       const routeChannel = portalClient.channel<RoutePublishPayload>(
         rutaAmbulanciaChannelId(ambulanceId)
@@ -272,39 +314,30 @@ export function EmergencyMap({
         });
 
       const velocidadMetrosPorSegundo = route.distanceMeters / route.durationSeconds;
-      const posicionInicial = ambulancePositionAt(route, 0);
-      const marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
-        .setLngLat([posicionInicial.lng, posicionInicial.lat])
-        .addTo(map);
-
-      const instancia: AmbulanceInstance = {
-        id: ambulanceId,
-        marker,
-        timer: null,
-        elapsedSeconds: 0,
-        route,
-        semaforosPendientes,
-        velocidadMetrosPorSegundo,
-        routeChannel,
-        ambulanceChannel,
-      };
-      ambulanceInstancesRef.current.set(ambulanceId, instancia);
-      recalcularSemaforosVisibles();
-
-      publishAmbulancePosition(ambulanceChannel, ambulanceId, posicionInicial);
-      void ejecutarTickOrquestacion(
-        ambulanceId,
-        posicionInicial,
-        velocidadMetrosPorSegundo,
-        semaforosPendientes
-      );
-
-      if (posicionInicial.arrived) return; // origin === destination, nada que animar
-
-      instancia.timer = setInterval(() => {
-        instancia.elapsedSeconds += AMBULANCE_TICK_SECONDS;
-        const posicion = ambulancePositionAt(route, instancia.elapsedSeconds);
-        instancia.marker.setLngLat([posicion.lng, posicion.lat]);
+      const fuente: PosicionSource = new InterpoladaPosicionSource(route);
+      let marker: mapboxgl.Marker | null = null;
+      // `.suscribir` emite la primera posición de forma síncrona (ver posicionSource.ts) — el
+      // callback de abajo corre antes de que esta misma línea termine de asignar
+      // `detenerFuente`, así que la instancia guarda un wrapper que lee la variable en el
+      // momento de llamarla, no en el momento de crearla.
+      let detenerFuente: () => void = () => {};
+      detenerFuente = fuente.suscribir((posicion) => {
+        if (marker) {
+          marker.setLngLat([posicion.lng, posicion.lat]);
+        } else {
+          marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
+            .setLngLat([posicion.lng, posicion.lat])
+            .addTo(map);
+          ambulanceInstancesRef.current.set(ambulanceId, {
+            id: ambulanceId,
+            marker,
+            semaforosPendientes,
+            routeChannel,
+            ambulanceChannel,
+            detenerFuente: () => detenerFuente(),
+          });
+          recalcularSemaforosVisibles();
+        }
         publishAmbulancePosition(ambulanceChannel, ambulanceId, posicion);
         void ejecutarTickOrquestacion(
           ambulanceId,
@@ -312,12 +345,72 @@ export function EmergencyMap({
           velocidadMetrosPorSegundo,
           semaforosPendientes
         );
-        if (posicion.arrived && instancia.timer !== null) {
-          clearInterval(instancia.timer);
-          instancia.timer = null;
-        }
-      }, AMBULANCE_TICK_MS);
+      });
     };
+
+    // Issue #12/#16: ambulancia con posición "real" (GPS, vía `POST /api/ambulance/[id]/
+    // position`) descubierta a través de ambulancias-activas — a diferencia de
+    // `iniciarAmbulancia`, este cliente no la creó: solo observa. No publica posición (el
+    // endpoint servidor ya lo hizo) ni dispara `/api/tick` (el endpoint servidor ya llama a
+    // `orquestarTick` directamente) — únicamente mueve el marker con lo que llegue por su canal.
+    const observarAmbulanciaRemota = async (ambulanceId: string) => {
+      if (idsConocidosRef.current.has(ambulanceId)) return;
+      idsConocidosRef.current.add(ambulanceId);
+
+      const routeChannel = portalClient.channel<RoutePublishPayload>(
+        rutaAmbulanciaChannelId(ambulanceId)
+      );
+      const ambulanceChannel = portalClient.channel<AmbulancePositionPayload>(
+        ambulanciaChannelId(ambulanceId)
+      );
+      routeChannel.acquire();
+      ambulanceChannel.acquire();
+
+      const ruta = await esperarPrimerMensaje(routeChannel);
+
+      if (!mountedRef.current || !ruta) {
+        routeChannel.release();
+        ambulanceChannel.release();
+        idsConocidosRef.current.delete(ambulanceId);
+        if (!ruta) {
+          console.error(`No se encontró ruta publicada para la ambulancia remota ${ambulanceId}.`);
+        }
+        return;
+      }
+
+      const semaforosPendientes = semaforosEnRuta(SEMAFOROS_SAN_BORJA_Y_COLINDANTES, ruta.geometry);
+      const marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
+        .setLngLat([ruta.origin.lng, ruta.origin.lat])
+        .addTo(map);
+
+      const fuente: PosicionSource = new RealPosicionSource(ambulanceChannel);
+      const detenerFuente = fuente.suscribir((posicion) => {
+        marker.setLngLat([posicion.lng, posicion.lat]);
+      });
+
+      ambulanceInstancesRef.current.set(ambulanceId, {
+        id: ambulanceId,
+        marker,
+        semaforosPendientes,
+        routeChannel,
+        ambulanceChannel,
+        detenerFuente,
+      });
+      recalcularSemaforosVisibles();
+    };
+
+    // Backfill (ambulancias ya anunciadas antes de este mount) + descubrimiento en vivo, en un
+    // solo mecanismo: `subscribe()` dispara tanto cuando llega el historial inicial como en cada
+    // anuncio nuevo, así que re-escanear `.messages` ahí cubre ambos casos — `observarAmbulancia
+    // Remota` ya deduplica por id, así que reprocesar mensajes ya vistos no hace nada.
+    const procesarAnunciosDeRegistro = () => {
+      if (!mountedRef.current) return;
+      for (const msg of ambulanciasActivasChannel.messages) {
+        void observarAmbulanciaRemota(msg.content.ambulanceId);
+      }
+    };
+    const cancelarAnuncios = ambulanciasActivasChannel.subscribe(procesarAnunciosDeRegistro);
+    procesarAnunciosDeRegistro();
 
     // El manejo de clicks vive dentro de "load" para que sea un no-op hasta que existan la
     // fuente/capa de la ruta — si no, un click durante la breve ventana de carga colocaría un
@@ -449,6 +542,7 @@ export function EmergencyMap({
     return () => {
       mountedRef.current = false;
       abortControllerRef.current?.abort();
+      cancelarAnuncios();
       detenerTodasLasInstancias();
       markerRef.current?.remove();
       map.remove();

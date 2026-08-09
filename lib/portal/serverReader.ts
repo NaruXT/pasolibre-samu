@@ -1,5 +1,5 @@
 import { WebSocket as NodeWebSocket } from "ws";
-import { Portal, type ChannelHandle } from "@portalsdk/core";
+import { Portal, type ChannelHandle, type ChannelOptions } from "@portalsdk/core";
 import { PORTAL_SEMAFOROS_CHANNEL_ID } from "./constants";
 import type { AccionSemaforo, DecisionSemaforoPublicada } from "@/lib/tick/decision";
 
@@ -18,10 +18,12 @@ if (!apiKeyEnv) {
 const apiKey: string = apiKeyEnv;
 
 // Cacheado en globalThis para sobrevivir al HMR de Next.js en dev — evita abrir una conexión
-// WebSocket nueva cada vez que este módulo se recarga (ver CLAUDE.md, ticket #7).
+// WebSocket nueva cada vez que este módulo se recarga (ver CLAUDE.md, ticket #7). Issue #12/#16:
+// generalizado de "un solo canal fijo" a un mapa por channelId — el endpoint de ingestión GPS
+// real necesita canales dinámicos por ambulancia sobre la misma conexión.
 const cachePortal = globalThis as unknown as {
   __portalServerReader?: Portal;
-  __canalDecisiones?: ChannelHandle<DecisionSemaforoPublicada>;
+  __canalesServidor?: Map<string, ChannelHandle<unknown>>;
 };
 
 function obtenerPortalReader(): Portal {
@@ -31,27 +33,7 @@ function obtenerPortalReader(): Portal {
   return cachePortal.__portalServerReader;
 }
 
-function obtenerCanalDecisiones(): ChannelHandle<DecisionSemaforoPublicada> {
-  // Se cachea el handle en sí (no solo un flag de "ya adquirido"): el SDK cuenta el acquire()
-  // por objeto de handle, así que si no se retiene ESE objeto, lo recolecta el GC y avisa
-  // "outstanding acquire()" aunque la conexión subyacente siga viva.
-  if (!cachePortal.__canalDecisiones) {
-    // history: 500 es un tope generoso para el puñado de semáforos de este proyecto, pero es
-    // un tope: decisiones más allá de los últimos 500 mensajes del canal dejarían de contar
-    // como "ya decidido". No relevante mientras el canal no acumule tráfico real.
-    const canal = obtenerPortalReader().channel<DecisionSemaforoPublicada>(
-      PORTAL_SEMAFOROS_CHANNEL_ID,
-      { history: 500 }
-    );
-    // Nunca se llama canal.release(): es un singleton de servidor de vida larga, no una
-    // suscripción por-request — se queda adquirido mientras el proceso viva.
-    canal.acquire();
-    cachePortal.__canalDecisiones = canal;
-  }
-  return cachePortal.__canalDecisiones;
-}
-
-function esperarListo(canal: ChannelHandle<DecisionSemaforoPublicada>, timeoutMs = 5000): Promise<void> {
+function esperarListo(canal: ChannelHandle<unknown>, channelId: string, timeoutMs = 5000): Promise<void> {
   if (canal.status === "ready") return Promise.resolve();
 
   return new Promise((resolve, reject) => {
@@ -59,9 +41,7 @@ function esperarListo(canal: ChannelHandle<DecisionSemaforoPublicada>, timeoutMs
 
     const temporizador = setTimeout(() => {
       cancelarSuscripcion();
-      reject(
-        new Error(`Portal: tiempo de espera agotado conectando a ${PORTAL_SEMAFOROS_CHANNEL_ID}`)
-      );
+      reject(new Error(`Portal: tiempo de espera agotado conectando a ${channelId}`));
     }, timeoutMs);
 
     cancelarSuscripcion = canal.on("status", (status, error) => {
@@ -79,22 +59,49 @@ function esperarListo(canal: ChannelHandle<DecisionSemaforoPublicada>, timeoutMs
 }
 
 /**
+ * Canal Portal del lado servidor, listo para leer/publicar (`.messages`, `.send()`) — mismo
+ * protocolo WebSocket anónimo que un cliente normal, igual que "portal listen" de
+ * `@portalsdk/cli`. La lectura vía REST con secret key está confirmada rota (siempre devuelve
+ * vacío); la escritura vía REST funciona pero no soporta `ephemeral` (ver `lib/portal/server.ts`
+ * y el invariante de CLAUDE.md) — esta es la única vía que soporta ambas cosas desde el server.
+ *
+ * Cacheado por `channelId`, no solo un handle fijo: cada canal se adquiere una única vez y
+ * nunca se libera (`release()`) — son singletons de servidor de vida larga, no suscripciones
+ * por-request, igual que el canal de decisiones original de este archivo.
+ */
+export async function obtenerCanalServidor<M>(
+  channelId: string,
+  options?: ChannelOptions
+): Promise<ChannelHandle<M>> {
+  if (!cachePortal.__canalesServidor) cachePortal.__canalesServidor = new Map();
+
+  let canal = cachePortal.__canalesServidor.get(channelId) as ChannelHandle<M> | undefined;
+  if (!canal) {
+    canal = obtenerPortalReader().channel<M>(channelId, options);
+    canal.acquire();
+    cachePortal.__canalesServidor.set(channelId, canal as ChannelHandle<unknown>);
+  }
+  await esperarListo(canal as ChannelHandle<unknown>, channelId);
+  return canal;
+}
+
+/**
  * Acciones ya publicadas para `(semaforoId, ambulanceId)` en semaforos-ruta-1 — fuente de
  * verdad de intervenciones (ver CLAUDE.md). Issue #12/#14: filtra por ambos campos, no solo
  * `semaforoId` — resuelve el gap documentado desde ticket #7 (una decisión de un trayecto
  * anterior, o de otra ambulancia activa a la vez, ya no bloquea una decisión nueva para el
  * mismo semáforo en un trayecto distinto).
- *
- * La lectura vía REST con secret key está confirmada rota (siempre devuelve vacío, sin
- * importar lo publicado); esto usa el mismo protocolo WebSocket anónimo que un cliente
- * normal, igual que "portal listen" de @portalsdk/cli.
  */
 export async function obtenerAccionesPreviasSemaforo(
   semaforoId: string,
   ambulanceId: string
 ): Promise<AccionSemaforo[]> {
-  const canal = obtenerCanalDecisiones();
-  await esperarListo(canal);
+  // history: 500 es un tope generoso para el puñado de semáforos de este proyecto, pero es
+  // un tope: decisiones más allá de los últimos 500 mensajes del canal dejarían de contar
+  // como "ya decidido". No relevante mientras el canal no acumule tráfico real.
+  const canal = await obtenerCanalServidor<DecisionSemaforoPublicada>(PORTAL_SEMAFOROS_CHANNEL_ID, {
+    history: 500,
+  });
   return canal.messages
     .filter(
       (mensaje) =>
