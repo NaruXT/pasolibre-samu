@@ -1,7 +1,7 @@
 import { WebSocket as NodeWebSocket } from "ws";
 import { Portal, type ChannelHandle } from "@portalsdk/core";
 import { PORTAL_SEMAFOROS_CHANNEL_ID } from "./constants";
-import type { AccionSemaforo, DecisionSemaforo } from "@/lib/tick/decision";
+import type { AccionSemaforo, DecisionSemaforoPublicada } from "@/lib/tick/decision";
 
 if (typeof globalThis.WebSocket === "undefined") {
   // El SDK de Portal solo usa el subconjunto estándar (send/close/addEventListener) que
@@ -21,7 +21,7 @@ const apiKey: string = apiKeyEnv;
 // WebSocket nueva cada vez que este módulo se recarga (ver CLAUDE.md, ticket #7).
 const cachePortal = globalThis as unknown as {
   __portalServerReader?: Portal;
-  __canalDecisiones?: ChannelHandle<DecisionSemaforo>;
+  __canalDecisiones?: ChannelHandle<DecisionSemaforoPublicada>;
 };
 
 function obtenerPortalReader(): Portal {
@@ -31,7 +31,7 @@ function obtenerPortalReader(): Portal {
   return cachePortal.__portalServerReader;
 }
 
-function obtenerCanalDecisiones(): ChannelHandle<DecisionSemaforo> {
+function obtenerCanalDecisiones(): ChannelHandle<DecisionSemaforoPublicada> {
   // Se cachea el handle en sí (no solo un flag de "ya adquirido"): el SDK cuenta el acquire()
   // por objeto de handle, así que si no se retiene ESE objeto, lo recolecta el GC y avisa
   // "outstanding acquire()" aunque la conexión subyacente siga viva.
@@ -39,9 +39,10 @@ function obtenerCanalDecisiones(): ChannelHandle<DecisionSemaforo> {
     // history: 500 es un tope generoso para el puñado de semáforos de este proyecto, pero es
     // un tope: decisiones más allá de los últimos 500 mensajes del canal dejarían de contar
     // como "ya decidido". No relevante mientras el canal no acumule tráfico real.
-    const canal = obtenerPortalReader().channel<DecisionSemaforo>(PORTAL_SEMAFOROS_CHANNEL_ID, {
-      history: 500,
-    });
+    const canal = obtenerPortalReader().channel<DecisionSemaforoPublicada>(
+      PORTAL_SEMAFOROS_CHANNEL_ID,
+      { history: 500 }
+    );
     // Nunca se llama canal.release(): es un singleton de servidor de vida larga, no una
     // suscripción por-request — se queda adquirido mientras el proceso viva.
     canal.acquire();
@@ -50,7 +51,7 @@ function obtenerCanalDecisiones(): ChannelHandle<DecisionSemaforo> {
   return cachePortal.__canalDecisiones;
 }
 
-function esperarListo(canal: ChannelHandle<DecisionSemaforo>, timeoutMs = 5000): Promise<void> {
+function esperarListo(canal: ChannelHandle<DecisionSemaforoPublicada>, timeoutMs = 5000): Promise<void> {
   if (canal.status === "ready") return Promise.resolve();
 
   return new Promise((resolve, reject) => {
@@ -78,22 +79,26 @@ function esperarListo(canal: ChannelHandle<DecisionSemaforo>, timeoutMs = 5000):
 }
 
 /**
- * Acciones ya publicadas para `semaforoId` en semaforos-ruta-1 — fuente de verdad de
- * intervenciones (ver CLAUDE.md). Filtra solo por `semaforoId`, sin acotar por trayecto: no
- * existe ningún `tripId` en este proyecto todavía, así que una decisión de un trayecto
- * anterior para el mismo semaforoId cuenta como "ya decidido" también en uno nuevo —
- * limitación conocida, documentada también en `orquestarTick`.
+ * Acciones ya publicadas para `(semaforoId, ambulanceId)` en semaforos-ruta-1 — fuente de
+ * verdad de intervenciones (ver CLAUDE.md). Issue #12/#14: filtra por ambos campos, no solo
+ * `semaforoId` — resuelve el gap documentado desde ticket #7 (una decisión de un trayecto
+ * anterior, o de otra ambulancia activa a la vez, ya no bloquea una decisión nueva para el
+ * mismo semáforo en un trayecto distinto).
  *
  * La lectura vía REST con secret key está confirmada rota (siempre devuelve vacío, sin
  * importar lo publicado); esto usa el mismo protocolo WebSocket anónimo que un cliente
  * normal, igual que "portal listen" de @portalsdk/cli.
  */
 export async function obtenerAccionesPreviasSemaforo(
-  semaforoId: string
+  semaforoId: string,
+  ambulanceId: string
 ): Promise<AccionSemaforo[]> {
   const canal = obtenerCanalDecisiones();
   await esperarListo(canal);
   return canal.messages
-    .filter((mensaje) => mensaje.content.semaforoId === semaforoId)
+    .filter(
+      (mensaje) =>
+        mensaje.content.semaforoId === semaforoId && mensaje.content.ambulanceId === ambulanceId
+    )
     .map((mensaje) => mensaje.content.accion);
 }

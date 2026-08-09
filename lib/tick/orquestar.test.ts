@@ -1,16 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import { orquestarTick, type OrquestarTickDeps } from "./orquestar";
-import type { AccionSemaforo, DecisionSemaforo } from "./decision";
+import type { AccionSemaforo, DecisionSemaforo, DecisionSemaforoPublicada } from "./decision";
 
 const DECISION_FAKE: Omit<DecisionSemaforo, "semaforoId"> = {
   accion: "mantener_ciclo",
   explicacion: "Decisión de prueba — doble en memoria, no invoca al LLM real (ticket #8).",
 };
 
-function crearDepsFake(accionesPreviasPorSemaforo: Record<string, AccionSemaforo[]> = {}) {
-  const decisionesPublicadas: DecisionSemaforo[] = [];
+const AMBULANCE_ID = "amb-1";
+const OTRA_AMBULANCE_ID = "amb-2";
+
+// Claves "semaforoId:ambulanceId" — imita cómo `serverReader.ts` escopa por ambos campos.
+function crearDepsFake(accionesPreviasPorClave: Record<string, AccionSemaforo[]> = {}) {
+  const decisionesPublicadas: DecisionSemaforoPublicada[] = [];
   const deps: OrquestarTickDeps = {
-    obtenerAccionesPrevias: async (semaforoId) => accionesPreviasPorSemaforo[semaforoId] ?? [],
+    obtenerAccionesPrevias: async (semaforoId, ambulanceId) =>
+      accionesPreviasPorClave[`${semaforoId}:${ambulanceId}`] ?? [],
     publicarDecision: async (decision) => {
       decisionesPublicadas.push(decision);
     },
@@ -33,7 +38,11 @@ describe("orquestarTick", () => {
     const { deps, decisionesPublicadas } = crearDepsFake();
 
     const resultados = await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_LEJOS, semaforosPendientes: [SEMAFORO_LEJOS] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_LEJOS,
+        semaforosPendientes: [SEMAFORO_LEJOS],
+      },
       deps
     );
 
@@ -45,22 +54,30 @@ describe("orquestarTick", () => {
     const { deps, decisionesPublicadas } = crearDepsFake();
 
     const resultados = await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 
     const decisionEsperada: DecisionSemaforo = { semaforoId: "sem-cerca", ...DECISION_FAKE };
     expect(resultados[0]?.decision).toEqual(decisionEsperada);
-    expect(decisionesPublicadas).toEqual([decisionEsperada]);
+    expect(decisionesPublicadas).toEqual([{ ...decisionEsperada, ambulanceId: AMBULANCE_ID }]);
   });
 
   test("semáforo dentro de la ventana con decisión ya publicada: no reinvoca", async () => {
     const { deps, decisionesPublicadas } = crearDepsFake({
-      "sem-cerca": ["mantener_ciclo"],
+      "sem-cerca:amb-1": ["mantener_ciclo"],
     });
 
     const resultados = await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 
@@ -68,11 +85,35 @@ describe("orquestarTick", () => {
     expect(decisionesPublicadas).toHaveLength(0);
   });
 
-  test("reconstruye la fase efectiva a partir de una decisión previa de anticipar_verde", async () => {
-    const { deps } = crearDepsFake({ "sem-cerca": ["anticipar_verde"] });
+  test("issue #12/#14: una decisión previa de OTRA ambulancia para el mismo semáforo no suprime la decisión de esta", async () => {
+    const { deps, decisionesPublicadas } = crearDepsFake({
+      "sem-cerca:amb-1": ["mantener_ciclo"],
+    });
 
     const resultados = await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: OTRA_AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
+      deps
+    );
+
+    expect(resultados[0]?.decision).not.toBeNull();
+    expect(decisionesPublicadas).toEqual([
+      { semaforoId: "sem-cerca", ...DECISION_FAKE, ambulanceId: OTRA_AMBULANCE_ID },
+    ]);
+  });
+
+  test("reconstruye la fase efectiva a partir de una decisión previa de anticipar_verde", async () => {
+    const { deps } = crearDepsFake({ "sem-cerca:amb-1": ["anticipar_verde"] });
+
+    const resultados = await orquestarTick(
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 
@@ -82,10 +123,14 @@ describe("orquestarTick", () => {
   });
 
   test("reconstruye la fase efectiva a partir de una decisión previa de extender_verde", async () => {
-    const { deps } = crearDepsFake({ "sem-cerca": ["extender_verde"] });
+    const { deps } = crearDepsFake({ "sem-cerca:amb-1": ["extender_verde"] });
 
     const resultados = await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 
@@ -101,7 +146,11 @@ describe("orquestarTick", () => {
     };
 
     await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 
@@ -133,7 +182,11 @@ describe("orquestarTick", () => {
     };
 
     await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 
@@ -153,20 +206,28 @@ describe("orquestarTick", () => {
     };
 
     await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_LEJOS, semaforosPendientes: [SEMAFORO_LEJOS] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_LEJOS,
+        semaforosPendientes: [SEMAFORO_LEJOS],
+      },
       deps
     );
     expect(llamadas).toBe(0);
 
     await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
     expect(llamadas).toBe(1);
   });
 
   test("TomTom no se re-consulta si el semáforo ya tiene decisión publicada (ticket #10)", async () => {
-    const { deps } = crearDepsFake({ "sem-cerca": ["mantener_ciclo"] });
+    const { deps } = crearDepsFake({ "sem-cerca:amb-1": ["mantener_ciclo"] });
     let llamadas = 0;
     deps.obtenerCongestionTransversal = async () => {
       llamadas++;
@@ -174,7 +235,11 @@ describe("orquestarTick", () => {
     };
 
     await orquestarTick(
-      { posicionAmbulancia: AMBULANCIA_CERCA, semaforosPendientes: [SEMAFORO_CERCA] },
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
       deps
     );
 

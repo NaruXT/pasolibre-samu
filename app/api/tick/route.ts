@@ -4,7 +4,7 @@ import { decidirAccionLLM } from "@/lib/tick/agent";
 import { publishToPortalChannel } from "@/lib/portal/server";
 import { obtenerAccionesPreviasSemaforo } from "@/lib/portal/serverReader";
 import { PORTAL_SEMAFOROS_CHANNEL_ID } from "@/lib/portal/constants";
-import type { DecisionSemaforo } from "@/lib/tick/decision";
+import type { DecisionSemaforoPublicada } from "@/lib/tick/decision";
 import { obtenerCongestionTransversal } from "@/lib/tomtom/trafficFlow";
 
 export async function POST(request: Request) {
@@ -15,9 +15,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "El body debe ser JSON válido." }, { status: 400 });
   }
 
-  if (!input?.posicionAmbulancia || !Array.isArray(input.semaforosPendientes)) {
+  if (
+    typeof input?.ambulanceId !== "string" ||
+    !input.posicionAmbulancia ||
+    !Array.isArray(input.semaforosPendientes)
+  ) {
     return NextResponse.json(
-      { error: "Se espera { posicionAmbulancia, semaforosPendientes }." },
+      { error: "Se espera { ambulanceId, posicionAmbulancia, semaforosPendientes }." },
       { status: 400 }
     );
   }
@@ -27,7 +31,7 @@ export async function POST(request: Request) {
       obtenerAccionesPrevias: obtenerAccionesPreviasSemaforo,
       decidirAccion: decidirAccionLLM,
       obtenerCongestionTransversal,
-      publicarDecision: async (decision: DecisionSemaforo) => {
+      publicarDecision: async (decision: DecisionSemaforoPublicada) => {
         await publishToPortalChannel({
           channelId: PORTAL_SEMAFOROS_CHANNEL_ID,
           content: decision,

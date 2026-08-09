@@ -54,6 +54,16 @@ export interface HospitalDestino {
   lat: number;
 }
 
+interface AmbulanceInstance {
+  id: string;
+  marker: mapboxgl.Marker;
+  timer: ReturnType<typeof setInterval> | null;
+  elapsedSeconds: number;
+  route: DrivingRoute;
+  semaforosPendientes: SemaforoEnRuta[];
+  velocidadMetrosPorSegundo: number;
+}
+
 interface EmergencyMapProps {
   onEmergencyPointChange: (point: EmergencyPoint | null) => void;
   onRouteStateChange: (state: RouteState) => void;
@@ -69,17 +79,27 @@ export function EmergencyMap({
   const markerRef = useRef<mapboxgl.Marker | null>(null);
   const requestIdRef = useRef(0);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const ambulanceMarkerRef = useRef<mapboxgl.Marker | null>(null);
-  const ambulanceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const semaforosDeLaRutaRef = useRef<SemaforoEnRuta[]>([]);
+  // Issue #12/#14: varias ambulancias simuladas a la vez, cada una con su propio marker/timer/
+  // ruta/semáforos pendientes — reemplaza los refs singulares que solo soportaban una. Clickear
+  // el mapa en modo default sigue reseteando todo (comportamiento original); "Agregar ambulancia"
+  // arma un modo de un solo click que suma una instancia sin tocar las existentes.
+  const ambulanceInstancesRef = useRef<Map<string, AmbulanceInstance>>(new Map());
+  const modoAgregarRef = useRef(false);
+  const mountedRef = useRef(true);
+  const [modoAgregarActivo, setModoAgregarActivo] = useState(false);
   const [loadedMap, setLoadedMap] = useState<mapboxgl.Map | null>(null);
   // El dataset fijo (ticket #9) tiene cientos de semáforos reales en 7 distritos — mostrarlos
   // todos a la vez (invariante original del ticket #6, pensada para 1 semáforo de prueba) satura
   // el mapa y el navegador (~1000 markers + ~1000 setInterval). Por eso solo se renderiza la
-  // lista ya filtrada por trayecto (`semaforosEnRuta`), no el dataset crudo completo.
+  // unión (deduplicada por semaforoId) de los corredores filtrados (`semaforosEnRuta`) de las
+  // ambulancias activas, no el dataset crudo completo.
   const [semaforosVisibles, setSemaforosVisibles] = useState<SemaforoEnRuta[]>([]);
   // Ticket #11: solo hace falta la última decisión por semáforo (el sistema ya decide una única
-  // vez por semáforo por trayecto — ver orquestarTick), no un historial de acciones.
+  // vez por semáforo por trayecto — ver orquestarTick), no un historial de acciones. Con varias
+  // ambulancias activas, dos trayectos distintos pueden decidir para el mismo semaforoId físico
+  // — el marcador en el mapa es uno solo por ubicación, así que solo puede mostrar la decisión
+  // más reciente que llegó, no las dos a la vez (límite de la UI, no de la orquestación: cada
+  // ambulancia sí decide de forma independiente — ver `orquestarTick`).
   const [decisionesPorSemaforo, setDecisionesPorSemaforo] = useState<
     Record<string, DecisionSemaforo>
   >({});
@@ -87,6 +107,7 @@ export function EmergencyMap({
   useEffect(() => {
     if (!containerRef.current || !MAPBOX_TOKEN) return;
 
+    mountedRef.current = true;
     mapboxgl.accessToken = MAPBOX_TOKEN;
     // Sin destino fijo, el encuadre inicial cubre el punto de partida de referencia y todo el
     // dataset de hospitales (mismos 7 distritos que el dataset de semáforos, ticket #9) en vez
@@ -111,10 +132,24 @@ export function EmergencyMap({
     routeChannel.acquire();
     ambulanceChannel.acquire();
 
-    const publishAmbulancePosition = (position: AmbulancePosition) => {
-      ambulanceChannel.send({ content: position, ephemeral: true }).catch((error) => {
-        console.error("No se pudo publicar la posición de la ambulancia en Portal:", error);
-      });
+    const publishAmbulancePosition = (ambulanceId: string, position: AmbulancePosition) => {
+      ambulanceChannel
+        .send({ content: { ...position, ambulanceId }, ephemeral: true })
+        .catch((error) => {
+          console.error("No se pudo publicar la posición de la ambulancia en Portal:", error);
+        });
+    };
+
+    // Unión deduplicada (por semaforoId) de los corredores filtrados de todas las instancias
+    // activas — el marcador en el mapa es uno por ubicación física, no uno por ambulancia.
+    const recalcularSemaforosVisibles = () => {
+      const vistos = new Map<string, SemaforoEnRuta>();
+      for (const instancia of ambulanceInstancesRef.current.values()) {
+        for (const semaforo of instancia.semaforosPendientes) {
+          vistos.set(semaforo.semaforoId, semaforo);
+        }
+      }
+      setSemaforosVisibles([...vistos.values()]);
     };
 
     // El seam de orquestación (ticket #7/#8) vive en /api/tick — este es el único punto donde
@@ -122,11 +157,14 @@ export function EmergencyMap({
     // calcula ETA/fase y decide (LLM real) si entra en la ventana de decisión; acá guardamos la
     // decisión completa (no solo la acción) para que `SemaforosCorredor` fuerce verde igual que
     // `faseEfectiva` del servidor, y además muestre la `explicacion` en un popup (ticket #11).
+    // Issue #12/#14: `ambulanceId` viaja en el body para que el servidor escope "ya decidido"
+    // por trayecto, no solo por semáforo.
     const ejecutarTickOrquestacion = async (
+      ambulanceId: string,
       position: AmbulancePosition,
-      velocidadMetrosPorSegundo: number
+      velocidadMetrosPorSegundo: number,
+      semaforosPendientes: SemaforoEnRuta[]
     ) => {
-      const semaforosPendientes = semaforosDeLaRutaRef.current;
       if (semaforosPendientes.length === 0) return;
 
       try {
@@ -134,6 +172,7 @@ export function EmergencyMap({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            ambulanceId,
             posicionAmbulancia: { lng: position.lng, lat: position.lat, velocidadMetrosPorSegundo },
             semaforosPendientes,
           }),
@@ -142,6 +181,7 @@ export function EmergencyMap({
 
         const { resultados }: { resultados: ResultadoSemaforo[] } = await response.json();
         if (resultados.every((resultado) => resultado.decision === null)) return;
+        if (!mountedRef.current) return;
 
         setDecisionesPorSemaforo((previo) => {
           const siguiente = { ...previo };
@@ -156,43 +196,69 @@ export function EmergencyMap({
       }
     };
 
-    const clearAmbulanceTimer = () => {
-      if (ambulanceTimerRef.current !== null) {
-        clearInterval(ambulanceTimerRef.current);
-        ambulanceTimerRef.current = null;
-      }
+    const detenerInstancia = (id: string) => {
+      const instancia = ambulanceInstancesRef.current.get(id);
+      if (!instancia) return;
+      if (instancia.timer !== null) clearInterval(instancia.timer);
+      instancia.marker.remove();
+      ambulanceInstancesRef.current.delete(id);
     };
 
-    const stopAmbulance = () => {
-      clearAmbulanceTimer();
-      ambulanceMarkerRef.current?.remove();
-      ambulanceMarkerRef.current = null;
+    const detenerTodasLasInstancias = () => {
+      for (const id of [...ambulanceInstancesRef.current.keys()]) detenerInstancia(id);
+      recalcularSemaforosVisibles();
     };
 
     // `route` debe venir del perfil "driving" plano — la ambulancia es un vehículo con
     // prioridad y nunca se ralentiza por tráfico, a diferencia del ETA que ve el usuario.
-    const startAmbulance = (route: DrivingRoute) => {
-      stopAmbulance();
+    const iniciarAmbulancia = (
+      ambulanceId: string,
+      route: DrivingRoute,
+      semaforosPendientes: SemaforoEnRuta[]
+    ) => {
       const velocidadMetrosPorSegundo = route.distanceMeters / route.durationSeconds;
-
-      let elapsedSeconds = 0;
-      const initialPosition = ambulancePositionAt(route, elapsedSeconds);
+      const posicionInicial = ambulancePositionAt(route, 0);
       const marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
-        .setLngLat([initialPosition.lng, initialPosition.lat])
+        .setLngLat([posicionInicial.lng, posicionInicial.lat])
         .addTo(map);
-      ambulanceMarkerRef.current = marker;
-      publishAmbulancePosition(initialPosition);
-      void ejecutarTickOrquestacion(initialPosition, velocidadMetrosPorSegundo);
 
-      if (initialPosition.arrived) return; // origin === destination, nada que animar
+      const instancia: AmbulanceInstance = {
+        id: ambulanceId,
+        marker,
+        timer: null,
+        elapsedSeconds: 0,
+        route,
+        semaforosPendientes,
+        velocidadMetrosPorSegundo,
+      };
+      ambulanceInstancesRef.current.set(ambulanceId, instancia);
+      recalcularSemaforosVisibles();
 
-      ambulanceTimerRef.current = setInterval(() => {
-        elapsedSeconds += AMBULANCE_TICK_SECONDS;
-        const position = ambulancePositionAt(route, elapsedSeconds);
-        marker.setLngLat([position.lng, position.lat]);
-        publishAmbulancePosition(position);
-        void ejecutarTickOrquestacion(position, velocidadMetrosPorSegundo);
-        if (position.arrived) clearAmbulanceTimer();
+      publishAmbulancePosition(ambulanceId, posicionInicial);
+      void ejecutarTickOrquestacion(
+        ambulanceId,
+        posicionInicial,
+        velocidadMetrosPorSegundo,
+        semaforosPendientes
+      );
+
+      if (posicionInicial.arrived) return; // origin === destination, nada que animar
+
+      instancia.timer = setInterval(() => {
+        instancia.elapsedSeconds += AMBULANCE_TICK_SECONDS;
+        const posicion = ambulancePositionAt(route, instancia.elapsedSeconds);
+        instancia.marker.setLngLat([posicion.lng, posicion.lat]);
+        publishAmbulancePosition(ambulanceId, posicion);
+        void ejecutarTickOrquestacion(
+          ambulanceId,
+          posicion,
+          velocidadMetrosPorSegundo,
+          semaforosPendientes
+        );
+        if (posicion.arrived && instancia.timer !== null) {
+          clearInterval(instancia.timer);
+          instancia.timer = null;
+        }
       }, AMBULANCE_TICK_MS);
     };
 
@@ -227,24 +293,44 @@ export function EmergencyMap({
 
         const { lng, lat } = event.lngLat;
 
-        markerRef.current?.remove();
-        markerRef.current = new mapboxgl.Marker({ color: "#dc2626" })
-          .setLngLat([lng, lat])
-          .addTo(map);
+        // Issue #12/#14: sin "Agregar ambulancia" armado, un click se comporta exactamente como
+        // antes (resetea todo — "nueva emergencia"). Con el modo armado (un solo click, se
+        // desarma acá mismo), en cambio suma una instancia sin tocar las existentes.
+        const esAgregar = modoAgregarRef.current;
+        modoAgregarRef.current = false;
+        setModoAgregarActivo(false);
 
-        onEmergencyPointChange({ lng, lat });
-        onRouteStateChange({ status: "loading" });
-
-        abortControllerRef.current?.abort();
-        const abortController = new AbortController();
-        abortControllerRef.current = abortController;
-        const requestId = ++requestIdRef.current;
+        const ambulanceId = crypto.randomUUID();
         const routeSource = () =>
           map.getSource(ROUTE_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
 
+        let requestId = -1;
+        let fetchOptions: { signal: AbortSignal };
+        if (esAgregar) {
+          fetchOptions = { signal: new AbortController().signal };
+        } else {
+          detenerTodasLasInstancias();
+          markerRef.current?.remove();
+          markerRef.current = new mapboxgl.Marker({ color: "#dc2626" })
+            .setLngLat([lng, lat])
+            .addTo(map);
+
+          onEmergencyPointChange({ lng, lat });
+          onRouteStateChange({ status: "loading" });
+
+          abortControllerRef.current?.abort();
+          const abortController = new AbortController();
+          abortControllerRef.current = abortController;
+          requestId = ++requestIdRef.current;
+          fetchOptions = { signal: abortController.signal };
+        }
+        // Para el flujo default, un click posterior invalida este: comparar contra
+        // requestIdRef.current. El flujo "agregar" no se cancela por otros clicks — cada
+        // ambulancia agregada corre independiente hasta resolver o fallar.
+        const sigueVigente = () => esAgregar || requestId === requestIdRef.current;
+
         try {
           const origin = { lng, lat };
-          const fetchOptions = { signal: abortController.signal };
 
           // Hospital más cercano por duración de ruta real (issue #12), no línea recta ni un
           // destino fijo — sin excluir ninguno por especialidad. La ruta "driving" que gana esta
@@ -254,34 +340,39 @@ export function EmergencyMap({
             HOSPITALES_SAN_BORJA_Y_COLINDANTES,
             { obtenerRuta: (o, d) => fetchDrivingRoute(o, d, "driving", fetchOptions) }
           );
-          if (requestId !== requestIdRef.current) return; // reemplazado por un click posterior
+          if (!mountedRef.current || !sigueVigente()) return;
 
           const destination = { lng: hospitalCercano.lng, lat: hospitalCercano.lat };
           const ambulanceRoute = hospitalCercano.ruta;
-          onDestinationChange?.({
-            nombre: hospitalCercano.nombre,
-            lng: hospitalCercano.lng,
-            lat: hospitalCercano.lat,
-          });
+          if (!esAgregar) {
+            onDestinationChange?.({
+              nombre: hospitalCercano.nombre,
+              lng: hospitalCercano.lng,
+              lat: hospitalCercano.lat,
+            });
+          }
           // Fetch separado a propósito: la ruta/ETA dibujada refleja tráfico real (lo que
           // experimentaría un auto normal); el ritmo propio de la ambulancia nunca lo hace
           // (vehículo con prioridad) — ver `ambulanceRoute` arriba, perfil "driving" plano.
           const displayRoute = await fetchDrivingRoute(origin, destination, "driving-traffic", fetchOptions);
-          if (requestId !== requestIdRef.current) return; // reemplazado por un click posterior
+          if (!mountedRef.current || !sigueVigente()) return;
 
-          routeSource()?.setData(toRouteFeature(displayRoute.geometry));
-          onRouteStateChange({ status: "ready", route: displayRoute });
+          // El flujo default sigue dibujando SU ruta como la línea "de tráfico" mostrada; con
+          // ambulancias agregadas, cada una publica su propia ruta a Portal pero no pisa la
+          // línea dibujada del flujo default (que es la única que se muestra en este mapa).
+          if (!esAgregar) {
+            routeSource()?.setData(toRouteFeature(displayRoute.geometry));
+            onRouteStateChange({ status: "ready", route: displayRoute });
+          }
 
-          // Nuevo trayecto: recorta el corredor fijo (ticket #9) a los semáforos dentro del
-          // buffer de esta ruta, y olvida las decisiones del trayecto anterior — son de otro
-          // recorrido, no de este.
+          // Corredor de esta ambulancia: recorta el corredor fijo (ticket #9) a los semáforos
+          // dentro del buffer de SU ruta — cada instancia tiene su propia lista, unida con las
+          // de las demás para renderizar (ver `recalcularSemaforosVisibles`).
           const semaforosDeLaRuta = semaforosEnRuta(
             SEMAFOROS_SAN_BORJA_Y_COLINDANTES,
             ambulanceRoute.geometry
           );
-          semaforosDeLaRutaRef.current = semaforosDeLaRuta;
-          setSemaforosVisibles(semaforosDeLaRuta);
-          setDecisionesPorSemaforo({});
+          if (!esAgregar) setDecisionesPorSemaforo({});
 
           // ruta-ambulancia-1 lleva la ruta propia de la ambulancia (no la ruta de tráfico que
           // se muestra) para que la línea de un suscriptor coincida exactamente con las
@@ -289,6 +380,7 @@ export function EmergencyMap({
           routeChannel
             .send({
               content: {
+                ambulanceId,
                 geometry: ambulanceRoute.geometry,
                 distanceMeters: ambulanceRoute.distanceMeters,
                 durationSeconds: ambulanceRoute.durationSeconds,
@@ -300,23 +392,25 @@ export function EmergencyMap({
               console.error("No se pudo publicar la ruta en Portal:", error);
             });
 
-          startAmbulance(ambulanceRoute);
+          iniciarAmbulancia(ambulanceId, ambulanceRoute, semaforosDeLaRuta);
         } catch (error) {
-          if (requestId !== requestIdRef.current) return;
+          if (!mountedRef.current || !sigueVigente()) return;
 
-          stopAmbulance();
-          routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
           const message = error instanceof Error ? error.message : String(error);
-          onRouteStateChange({ status: "error", message });
-          onDestinationChange?.(null);
+          if (!esAgregar) {
+            routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
+            onRouteStateChange({ status: "error", message });
+            onDestinationChange?.(null);
+          }
           console.error("No se pudo calcular la ruta al hospital más cercano:", error);
         }
       });
     });
 
     return () => {
+      mountedRef.current = false;
       abortControllerRef.current?.abort();
-      stopAmbulance();
+      detenerTodasLasInstancias();
       markerRef.current?.remove();
       map.remove();
       routeChannel.release();
@@ -334,8 +428,21 @@ export function EmergencyMap({
   }
 
   return (
-    <>
+    <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+      {loadedMap && (
+        <button
+          type="button"
+          onClick={() => {
+            modoAgregarRef.current = true;
+            setModoAgregarActivo(true);
+          }}
+          disabled={modoAgregarActivo}
+          className="absolute left-4 top-4 z-10 rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow disabled:cursor-default disabled:opacity-80 dark:bg-zinc-800 dark:text-zinc-100"
+        >
+          {modoAgregarActivo ? "Click en el mapa para agregar…" : "Agregar ambulancia"}
+        </button>
+      )}
       {loadedMap && (
         <SemaforosCorredor
           map={loadedMap}
@@ -343,6 +450,6 @@ export function EmergencyMap({
           decisionesPorSemaforo={decisionesPorSemaforo}
         />
       )}
-    </>
+    </div>
   );
 }

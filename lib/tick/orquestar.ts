@@ -1,5 +1,5 @@
 import { calcularETASegundos, type LngLat } from "./eta";
-import type { AccionSemaforo, DecisionSemaforo } from "./decision";
+import type { AccionSemaforo, DecisionSemaforo, DecisionSemaforoPublicada } from "./decision";
 import type { ContextoDecisionSemaforo } from "./agent";
 import { faseEfectiva } from "@/lib/semaforo/faseEfectiva";
 import type { FaseSemaforo } from "@/lib/semaforo/fase";
@@ -17,6 +17,8 @@ export interface PosicionAmbulancia extends LngLat {
 }
 
 export interface OrquestarTickInput {
+  /** Identidad de trayecto (issue #12/#14) — scopea "ya decidido" por ambulancia, no solo por semáforo. */
+  ambulanceId: string;
   posicionAmbulancia: PosicionAmbulancia;
   semaforosPendientes: SemaforoPendiente[];
 }
@@ -29,9 +31,12 @@ export interface ResultadoSemaforo {
 }
 
 export interface OrquestarTickDeps {
-  /** Fronteras de I/O real — en producción hablan con Portal/el LLM, en tests son dobles en memoria. */
-  obtenerAccionesPrevias: (semaforoId: string) => Promise<AccionSemaforo[]>;
-  publicarDecision: (decision: DecisionSemaforo) => Promise<void>;
+  /**
+   * Fronteras de I/O real — en producción hablan con Portal/el LLM, en tests son dobles en
+   * memoria. Escopadas por `(semaforoId, ambulanceId)`, no solo `semaforoId` (issue #12/#14).
+   */
+  obtenerAccionesPrevias: (semaforoId: string, ambulanceId: string) => Promise<AccionSemaforo[]>;
+  publicarDecision: (decision: DecisionSemaforoPublicada) => Promise<void>;
   /** Agente de decisión (LLM real en producción, ticket #8) — inyectado para no gastar cuota en tests. */
   decidirAccion: (contexto: ContextoDecisionSemaforo) => Promise<DecisionSemaforo>;
   /**
@@ -50,14 +55,18 @@ export interface OrquestarTickDeps {
 /**
  * El seam principal del proyecto: por cada semáforo pendiente calcula ETA y fase (funciones
  * puras, se ejecutan de verdad), y si el ETA entra en la ventana de decisión y el semáforo
- * todavía no tiene ninguna decisión publicada, invoca al agente (LLM real, ticket #8; `deps`
- * lo inyecta para no gastar cuota en tests) una sola vez y publica su decisión.
+ * todavía no tiene ninguna decisión publicada **para este `ambulanceId`**, invoca al agente
+ * (LLM real, ticket #8; `deps` lo inyecta para no gastar cuota en tests) una sola vez y
+ * publica su decisión.
  *
- * "Todavía no tiene decisión" se resuelve consultando semaforos-ruta-1 solo por `semaforoId`
- * (ver `deps.obtenerAccionesPrevias`) — no existe un `tripId`/`trayectoId` en ningún payload
- * de este proyecto todavía (tickets #1-#6 tampoco lo tienen), así que esto NO está acotado
- * por trayecto: una decisión de un trayecto anterior para el mismo semaforoId bloquearía una
- * nueva decisión en un trayecto nuevo. Limitación conocida, no resuelta por este ticket.
+ * "Todavía no tiene decisión" se resuelve consultando semaforos-ruta-1 por `(semaforoId,
+ * ambulanceId)` (ver `deps.obtenerAccionesPrevias`) — issue #12/#14 resuelve así, como efecto
+ * colateral, el gap documentado desde ticket #7: antes solo se filtraba por `semaforoId`, así
+ * que una decisión de un trayecto anterior (o de otra ambulancia activa a la vez) bloqueaba una
+ * decisión nueva para el mismo semáforo. Con dos ambulancias cruzando el mismo semáforo, cada
+ * una decide independientemente — lo que sí sigue siendo cierto es que un único marcador en el
+ * mapa no puede mostrar dos decisiones distintas a la vez para la misma ubicación física (ver
+ * `components/EmergencyMap.tsx`); eso es un límite de la UI, no de esta función.
  */
 export async function orquestarTick(
   input: OrquestarTickInput,
@@ -73,7 +82,7 @@ export async function orquestarTick(
       input.posicionAmbulancia.velocidadMetrosPorSegundo
     );
 
-    const accionesPrevias = await deps.obtenerAccionesPrevias(semaforo.semaforoId);
+    const accionesPrevias = await deps.obtenerAccionesPrevias(semaforo.semaforoId, input.ambulanceId);
     const yaTieneDecision = accionesPrevias.length > 0;
 
     let decision: DecisionSemaforo | null = null;
@@ -86,7 +95,7 @@ export async function orquestarTick(
         fase: faseAntesDeDecidir,
         congestionTransversal,
       });
-      await deps.publicarDecision(decision);
+      await deps.publicarDecision({ ...decision, ambulanceId: input.ambulanceId });
       accionesPrevias.push(decision.accion);
     }
 
