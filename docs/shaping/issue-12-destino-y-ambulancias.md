@@ -82,3 +82,11 @@ El mapa puede mostrar N ambulancias moviéndose simultáneamente (simuladas y/o 
 | R8 | 🟡 Canal Portal real y separado por ambulancia | ✅ | ✅ |
 
 Slices #13, #14, #15 y #16 cerrados e implementados (ver commits referenciados en los issues) — issue #12 completo. Detalle de los hallazgos reales del slice #16 (restricción de URL en el token de Mapbox, race de lectura de historial Portal) en `CLAUDE.md`.
+
+### Post-#16: la simulación también se movió al servidor
+
+Bug real reportado por el usuario probando en vivo después de cerrar el issue #12: una ambulancia simulada creada, luego observada desde una pestaña recargada (o `/ambulance-watch`, u otra pestaña), aparecía pero quedaba congelada — `InterpoladaPosicionSource` vivía como timer en la pestaña que la creó, y esa pestaña recargándose mataba el timer sin que nadie más volviera a publicar posición.
+
+Fix (fuera del alcance original de A5/A6, pero mismo mecanismo): `lib/tick/simulacion.ts` corre la simulación en el servidor, igual que a una ambulancia GPS real — `POST /api/ambulance/[id]/simulate` la arranca, `DELETE` la detiene. `EmergencyMap.tsx` deja de "crear" ambulancias del todo; solo hace ese `fetch` y observa la respuesta con el mismo mecanismo (`observarAmbulancia`) que ya usaba para las reales — post-#16 no queda ninguna distinción real entre simulada y real desde la perspectiva del cliente.
+
+Efecto colateral de esto: resetear el mapa o cerrar/recargar la pestaña ahora también detiene, en el servidor, las simulaciones que esa pestaña arrancó (decisión explícita del usuario, para no dejar simulaciones corriendo para siempre gastando cuota del LLM) — requirió descubrir que el cleanup de `useEffect` no corre en una recarga dura, y engancharse a `pagehide` + `fetch(..., {keepalive:true})` en su lugar. Ver CLAUDE.md para el detalle completo.

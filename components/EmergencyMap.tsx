@@ -5,17 +5,13 @@ import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { Feature, LineString } from "geojson";
 import type { ChannelHandle } from "@portalsdk/core";
-import { fetchDrivingRoute, type DrivingRoute, type LngLat, type RouteState } from "@/lib/mapbox/directions";
-import type { AmbulancePosition } from "@/lib/mapbox/ambulance";
-import {
-  InterpoladaPosicionSource,
-  RealPosicionSource,
-  type PosicionSource,
-} from "@/lib/mapbox/posicionSource";
+import type { RouteState } from "@/lib/mapbox/directions";
+import { RealPosicionSource, type PosicionSource } from "@/lib/mapbox/posicionSource";
 import { portalClient } from "@/lib/portal/client";
 import {
   ambulanciaChannelId,
   PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
+  PORTAL_SEMAFOROS_CHANNEL_ID,
   rutaAmbulanciaChannelId,
 } from "@/lib/portal/constants";
 import type {
@@ -26,10 +22,9 @@ import type {
 import { SemaforosCorredor } from "@/components/SemaforosCorredor";
 import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBorjaYColindantes";
 import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
-import { hospitalMasCercano } from "@/lib/hospital/hospitalMasCercano";
 import { HOSPITALES_SAN_BORJA_Y_COLINDANTES } from "@/lib/hospital/hospitalesSanBorjaYColindantes";
-import type { DecisionSemaforo } from "@/lib/tick/decision";
-import type { ResultadoSemaforo } from "@/lib/tick/orquestar";
+import type { DecisionSemaforo, DecisionSemaforoPublicada } from "@/lib/tick/decision";
+import type { ResultadoIniciarSimulacion } from "@/lib/tick/simulacion";
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
@@ -73,10 +68,9 @@ interface AmbulanceInstance {
   // adquiere al arrancar/observar la instancia y se libera al detenerla.
   routeChannel: ChannelHandle<RoutePublishPayload>;
   ambulanceChannel: ChannelHandle<AmbulancePositionPayload>;
-  // Issue #12/#16: source-agnostic — simulada (timer local, `InterpoladaPosicionSource`) o
-  // real (empujada por Portal, `RealPosicionSource`). Detiene lo que corresponda según la
-  // fuente (clearInterval / cancelar suscripción Portal), sin que este archivo tenga que saber
-  // cuál es.
+  // Post-slice #16: este cliente solo observa (`RealPosicionSource`, empujada por Portal) — la
+  // simulación en sí (`InterpoladaPosicionSource`) corre del lado servidor (`lib/tick/simulacion.ts`)
+  // sin importar si la ambulancia es simulada o GPS real. `detenerFuente` cancela la suscripción.
   detenerFuente: () => void;
 }
 
@@ -100,10 +94,16 @@ export function EmergencyMap({
   // el mapa en modo default sigue reseteando todo (comportamiento original); "Agregar ambulancia"
   // arma un modo de un solo click que suma una instancia sin tocar las existentes.
   const ambulanceInstancesRef = useRef<Map<string, AmbulanceInstance>>(new Map());
-  // Issue #12/#16: ids ya conocidos, propios o remotos — evita que el descubrimiento vía
-  // ambulancias-activas intente "observar como remota" una ambulancia que este mismo cliente
-  // ya creó (su propio anuncio le puede volver por el mismo canal).
+  // Issue #12/#16: ids ya conocidos — evita que el descubrimiento vía ambulancias-activas
+  // intente observar dos veces la misma ambulancia (su propio anuncio le puede volver a este
+  // mismo cliente por el mismo canal).
   const idsConocidosRef = useRef<Set<string>>(new Set());
+  // Post-slice #16: ids de simulaciones que ESTE cliente arrancó (vía POST a
+  // /api/ambulance/[id]/simulate) — a diferencia de las meramente observadas (creadas por otra
+  // pestaña, o reales), este cliente es responsable de pedirle al servidor que las detenga al
+  // resetear el mapa o desmontar, para no dejar simulaciones "abandonadas" corriendo para
+  // siempre (cada tick real gasta cuota del LLM).
+  const misSimulacionesRef = useRef<Set<string>>(new Set());
   const modoAgregarRef = useRef(false);
   const mountedRef = useRef(true);
   const [modoAgregarActivo, setModoAgregarActivo] = useState(false);
@@ -128,6 +128,26 @@ export function EmergencyMap({
     if (!containerRef.current || !MAPBOX_TOKEN) return;
 
     mountedRef.current = true;
+    // Capturado una vez: el mismo Set vive durante todo el ciclo de vida del efecto (nunca se
+    // reasigna), así que leerlo acá en vez de `misSimulacionesRef.current` en cada sitio evita
+    // la advertencia de exhaustive-deps sobre refs leídos en el cleanup.
+    const misSimulaciones = misSimulacionesRef.current;
+
+    // Descubierto en vivo probando este mismo fix: el cleanup de useEffect (el `return () =>
+    // {...}` de más abajo) NO corre en una recarga dura o al cerrar la pestaña — React solo lo
+    // dispara cuando desmonta el componente por su cuenta (ej. navegación SPA), y acá no hay
+    // ninguna. En una recarga real, el navegador destruye el contexto de JS antes de que React
+    // tenga chance de reaccionar. `pagehide` es el evento correcto para engancharse (más
+    // confiable que `beforeunload` con el bfcache); `keepalive` dejar que el fetch de DELETE
+    // siga en vuelo aunque la página ya se esté descargando.
+    const detenerMisSimulaciones = () => {
+      for (const id of misSimulaciones) {
+        fetch(`/api/ambulance/${id}/simulate`, { method: "DELETE", keepalive: true }).catch(() => {});
+      }
+      misSimulaciones.clear();
+    };
+    window.addEventListener("pagehide", detenerMisSimulaciones);
+
     mapboxgl.accessToken = MAPBOX_TOKEN;
     // Sin destino fijo, el encuadre inicial cubre el punto de partida de referencia y todo el
     // dataset de hospitales (mismos 7 distritos que el dataset de semáforos, ticket #9) en vez
@@ -148,23 +168,33 @@ export function EmergencyMap({
     // Issue #12/#15: canal fijo de descubrimiento — cada ambulancia anuncia acá su propio id al
     // arrancar, para que un watcher (ej. /ambulance-watch) sepa qué canales por-ambulancia
     // suscribir dinámicamente. Los canales de ruta/posición en sí ya no son compartidos (ver
-    // AmbulanceInstance) — cada ambulancia adquiere los suyos en `iniciarAmbulancia`.
+    // AmbulanceInstance) — este cliente adquiere los suyos al observarla en `observarAmbulancia`.
     const ambulanciasActivasChannel = portalClient.channel<AmbulanciaActivaPayload>(
       PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
     );
     ambulanciasActivasChannel.acquire();
 
-    const publishAmbulancePosition = (
-      ambulanceChannel: ChannelHandle<AmbulancePositionPayload>,
-      ambulanceId: string,
-      position: AmbulancePosition
-    ) => {
-      ambulanceChannel
-        .send({ content: { ...position, ambulanceId }, ephemeral: true })
-        .catch((error) => {
-          console.error("No se pudo publicar la posición de la ambulancia en Portal:", error);
-        });
+    // Post-slice #16: todas las ambulancias (simuladas o reales) las mueve el servidor — este
+    // cliente nunca publica posición ni dispara /api/tick por su cuenta, solo observa. Las
+    // decisiones semafóricas (ticket #11) se leen directo de semaforos-ruta-1, no de la
+    // respuesta de un tick propio — cualquier tick, sin importar qué ambulancia lo disparó,
+    // actualiza esta vista igual.
+    const decisionesChannel = portalClient.channel<DecisionSemaforoPublicada>(
+      PORTAL_SEMAFOROS_CHANNEL_ID
+    );
+    decisionesChannel.acquire();
+    const procesarDecisiones = () => {
+      if (!mountedRef.current || decisionesChannel.messages.length === 0) return;
+      setDecisionesPorSemaforo((previo) => {
+        const siguiente = { ...previo };
+        for (const msg of decisionesChannel.messages) {
+          siguiente[msg.content.semaforoId] = msg.content;
+        }
+        return siguiente;
+      });
     };
+    const cancelarDecisiones = decisionesChannel.subscribe(procesarDecisiones);
+    procesarDecisiones();
 
     // Unión deduplicada (por semaforoId) de los corredores filtrados de todas las instancias
     // activas — el marcador en el mapa es uno por ubicación física, no uno por ambulancia.
@@ -176,50 +206,6 @@ export function EmergencyMap({
         }
       }
       setSemaforosVisibles([...vistos.values()]);
-    };
-
-    // El seam de orquestación (ticket #7/#8) vive en /api/tick — este es el único punto donde
-    // el cliente lo invoca. Por cada semáforo del corredor filtrado (ticket #9), el servidor
-    // calcula ETA/fase y decide (LLM real) si entra en la ventana de decisión; acá guardamos la
-    // decisión completa (no solo la acción) para que `SemaforosCorredor` fuerce verde igual que
-    // `faseEfectiva` del servidor, y además muestre la `explicacion` en un popup (ticket #11).
-    // Issue #12/#14: `ambulanceId` viaja en el body para que el servidor escope "ya decidido"
-    // por trayecto, no solo por semáforo.
-    const ejecutarTickOrquestacion = async (
-      ambulanceId: string,
-      position: AmbulancePosition,
-      velocidadMetrosPorSegundo: number,
-      semaforosPendientes: SemaforoEnRuta[]
-    ) => {
-      if (semaforosPendientes.length === 0) return;
-
-      try {
-        const response = await fetch("/api/tick", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ambulanceId,
-            posicionAmbulancia: { lng: position.lng, lat: position.lat, velocidadMetrosPorSegundo },
-            semaforosPendientes,
-          }),
-        });
-        if (!response.ok) throw new Error(`Tick de orquestación falló (${response.status}).`);
-
-        const { resultados }: { resultados: ResultadoSemaforo[] } = await response.json();
-        if (resultados.every((resultado) => resultado.decision === null)) return;
-        if (!mountedRef.current) return;
-
-        setDecisionesPorSemaforo((previo) => {
-          const siguiente = { ...previo };
-          for (const resultado of resultados) {
-            if (!resultado.decision) continue;
-            siguiente[resultado.semaforoId] = resultado.decision;
-          }
-          return siguiente;
-        });
-      } catch (error) {
-        console.error("No se pudo ejecutar el tick de orquestación:", error);
-      }
     };
 
     const detenerInstancia = (id: string) => {
@@ -270,90 +256,12 @@ export function EmergencyMap({
       });
     };
 
-    // `route` debe venir del perfil "driving" plano — la ambulancia es un vehículo con
-    // prioridad y nunca se ralentiza por tráfico, a diferencia del ETA que ve el usuario.
-    const iniciarAmbulancia = (
-      ambulanceId: string,
-      route: DrivingRoute,
-      origin: LngLat,
-      destination: LngLat,
-      semaforosPendientes: SemaforoEnRuta[]
-    ) => {
-      idsConocidosRef.current.add(ambulanceId);
-
-      // Issue #12/#15: canal Portal real y propio de esta ambulancia, no uno compartido.
-      const routeChannel = portalClient.channel<RoutePublishPayload>(
-        rutaAmbulanciaChannelId(ambulanceId)
-      );
-      const ambulanceChannel = portalClient.channel<AmbulancePositionPayload>(
-        ambulanciaChannelId(ambulanceId)
-      );
-      routeChannel.acquire();
-      ambulanceChannel.acquire();
-
-      ambulanciasActivasChannel.send({ content: { ambulanceId } }).catch((error) => {
-        console.error("No se pudo anunciar la ambulancia en Portal:", error);
-      });
-
-      // El propio canal de ruta de esta ambulancia lleva su geometría/metadata (no la ruta de
-      // tráfico que se muestra) para que un suscriptor coincida exactamente con las
-      // actualizaciones de posición en su canal de posición.
-      routeChannel
-        .send({
-          content: {
-            ambulanceId,
-            geometry: route.geometry,
-            distanceMeters: route.distanceMeters,
-            durationSeconds: route.durationSeconds,
-            origin,
-            destination,
-          },
-        })
-        .catch((error) => {
-          console.error("No se pudo publicar la ruta en Portal:", error);
-        });
-
-      const velocidadMetrosPorSegundo = route.distanceMeters / route.durationSeconds;
-      const fuente: PosicionSource = new InterpoladaPosicionSource(route);
-      let marker: mapboxgl.Marker | null = null;
-      // `.suscribir` emite la primera posición de forma síncrona (ver posicionSource.ts) — el
-      // callback de abajo corre antes de que esta misma línea termine de asignar
-      // `detenerFuente`, así que la instancia guarda un wrapper que lee la variable en el
-      // momento de llamarla, no en el momento de crearla.
-      let detenerFuente: () => void = () => {};
-      detenerFuente = fuente.suscribir((posicion) => {
-        if (marker) {
-          marker.setLngLat([posicion.lng, posicion.lat]);
-        } else {
-          marker = new mapboxgl.Marker({ element: createAmbulanceElement() })
-            .setLngLat([posicion.lng, posicion.lat])
-            .addTo(map);
-          ambulanceInstancesRef.current.set(ambulanceId, {
-            id: ambulanceId,
-            marker,
-            semaforosPendientes,
-            routeChannel,
-            ambulanceChannel,
-            detenerFuente: () => detenerFuente(),
-          });
-          recalcularSemaforosVisibles();
-        }
-        publishAmbulancePosition(ambulanceChannel, ambulanceId, posicion);
-        void ejecutarTickOrquestacion(
-          ambulanceId,
-          posicion,
-          velocidadMetrosPorSegundo,
-          semaforosPendientes
-        );
-      });
-    };
-
-    // Issue #12/#16: ambulancia con posición "real" (GPS, vía `POST /api/ambulance/[id]/
-    // position`) descubierta a través de ambulancias-activas — a diferencia de
-    // `iniciarAmbulancia`, este cliente no la creó: solo observa. No publica posición (el
-    // endpoint servidor ya lo hizo) ni dispara `/api/tick` (el endpoint servidor ya llama a
-    // `orquestarTick` directamente) — únicamente mueve el marker con lo que llegue por su canal.
-    const observarAmbulanciaRemota = async (ambulanceId: string) => {
+    // Post-slice #16: toda ambulancia (simulada por este cliente o por otro, o GPS real) la
+    // mueve el servidor — este archivo nunca la "crea" ni publica posición por su cuenta, solo
+    // observa lo que llegue por sus canales. Arrancar una simulación es un `fetch` a
+    // `/api/ambulance/[id]/simulate` (ver el click handler más abajo); una vez que el servidor
+    // publica la ruta + el anuncio, esta misma función la recoge igual que a cualquier otra.
+    const observarAmbulancia = async (ambulanceId: string) => {
       if (idsConocidosRef.current.has(ambulanceId)) return;
       idsConocidosRef.current.add(ambulanceId);
 
@@ -373,7 +281,7 @@ export function EmergencyMap({
         ambulanceChannel.release();
         idsConocidosRef.current.delete(ambulanceId);
         if (!ruta) {
-          console.error(`No se encontró ruta publicada para la ambulancia remota ${ambulanceId}.`);
+          console.error(`No se encontró ruta publicada para la ambulancia ${ambulanceId}.`);
         }
         return;
       }
@@ -401,12 +309,12 @@ export function EmergencyMap({
 
     // Backfill (ambulancias ya anunciadas antes de este mount) + descubrimiento en vivo, en un
     // solo mecanismo: `subscribe()` dispara tanto cuando llega el historial inicial como en cada
-    // anuncio nuevo, así que re-escanear `.messages` ahí cubre ambos casos — `observarAmbulancia
-    // Remota` ya deduplica por id, así que reprocesar mensajes ya vistos no hace nada.
+    // anuncio nuevo, así que re-escanear `.messages` ahí cubre ambos casos — `observarAmbulancia`
+    // ya deduplica por id, así que reprocesar mensajes ya vistos no hace nada.
     const procesarAnunciosDeRegistro = () => {
       if (!mountedRef.current) return;
       for (const msg of ambulanciasActivasChannel.messages) {
-        void observarAmbulanciaRemota(msg.content.ambulanceId);
+        void observarAmbulancia(msg.content.ambulanceId);
       }
     };
     const cancelarAnuncios = ambulanciasActivasChannel.subscribe(procesarAnunciosDeRegistro);
@@ -459,6 +367,10 @@ export function EmergencyMap({
         if (esAgregar) {
           fetchOptions = { signal: new AbortController().signal };
         } else {
+          // A pedido del usuario: resetear el mapa también detiene, en el servidor, las
+          // simulaciones que ESTE cliente arrancó — no solo deja de observarlas acá. Sin esto
+          // quedarían corriendo para siempre (cada tick real gasta cuota del LLM).
+          detenerMisSimulaciones();
           detenerTodasLasInstancias();
           markerRef.current?.remove();
           markerRef.current = new mapboxgl.Marker({ color: "#dc2626" })
@@ -480,51 +392,34 @@ export function EmergencyMap({
         const sigueVigente = () => esAgregar || requestId === requestIdRef.current;
 
         try {
-          const origin = { lng, lat };
-
-          // Hospital más cercano por duración de ruta real (issue #12), no línea recta ni un
-          // destino fijo — sin excluir ninguno por especialidad. La ruta "driving" que gana esta
-          // comparación es directamente `ambulanceRoute`: no hace falta pedirla de nuevo.
-          const hospitalCercano = await hospitalMasCercano(
-            origin,
-            HOSPITALES_SAN_BORJA_Y_COLINDANTES,
-            { obtenerRuta: (o, d) => fetchDrivingRoute(o, d, "driving", fetchOptions) }
-          );
+          // Post-slice #16: el cliente ya no calcula hospital/ruta ni simula nada — le pide al
+          // servidor que arranque (o reinicie) la simulación de esta ambulancia. El servidor
+          // hace exactamente lo que antes hacía este click handler (hospital más cercano por
+          // ruta real, sin excluir por especialidad) y además la mueve, sin depender de que
+          // esta pestaña siga abierta — mismo mecanismo que una ambulancia GPS real.
+          const response = await fetch(`/api/ambulance/${ambulanceId}/simulate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ lat, lng }),
+            signal: fetchOptions.signal,
+          });
+          if (!response.ok) throw new Error(`No se pudo arrancar la simulación (${response.status}).`);
+          const data: ResultadoIniciarSimulacion = await response.json();
           if (!mountedRef.current || !sigueVigente()) return;
 
-          const destination = { lng: hospitalCercano.lng, lat: hospitalCercano.lat };
-          const ambulanceRoute = hospitalCercano.ruta;
+          misSimulaciones.add(ambulanceId);
+
           if (!esAgregar) {
-            onDestinationChange?.({
-              nombre: hospitalCercano.nombre,
-              lng: hospitalCercano.lng,
-              lat: hospitalCercano.lat,
-            });
+            onDestinationChange?.(data.destino);
+            // El flujo default dibuja la línea "de tráfico" (perfil driving-traffic, la que ve
+            // el usuario); con ambulancias agregadas, cada una publica su propia ruta a Portal
+            // pero no pisa esta línea (la única que se muestra en el mapa).
+            routeSource()?.setData(toRouteFeature(data.rutaTrafico.geometry));
+            onRouteStateChange({ status: "ready", route: data.rutaTrafico });
           }
-          // Fetch separado a propósito: la ruta/ETA dibujada refleja tráfico real (lo que
-          // experimentaría un auto normal); el ritmo propio de la ambulancia nunca lo hace
-          // (vehículo con prioridad) — ver `ambulanceRoute` arriba, perfil "driving" plano.
-          const displayRoute = await fetchDrivingRoute(origin, destination, "driving-traffic", fetchOptions);
-          if (!mountedRef.current || !sigueVigente()) return;
-
-          // El flujo default sigue dibujando SU ruta como la línea "de tráfico" mostrada; con
-          // ambulancias agregadas, cada una publica su propia ruta a Portal pero no pisa la
-          // línea dibujada del flujo default (que es la única que se muestra en este mapa).
-          if (!esAgregar) {
-            routeSource()?.setData(toRouteFeature(displayRoute.geometry));
-            onRouteStateChange({ status: "ready", route: displayRoute });
-          }
-
-          // Corredor de esta ambulancia: recorta el corredor fijo (ticket #9) a los semáforos
-          // dentro del buffer de SU ruta — cada instancia tiene su propia lista, unida con las
-          // de las demás para renderizar (ver `recalcularSemaforosVisibles`).
-          const semaforosDeLaRuta = semaforosEnRuta(
-            SEMAFOROS_SAN_BORJA_Y_COLINDANTES,
-            ambulanceRoute.geometry
-          );
-          if (!esAgregar) setDecisionesPorSemaforo({});
-
-          iniciarAmbulancia(ambulanceId, ambulanceRoute, origin, destination, semaforosDeLaRuta);
+          // El marker y la coordinación semafórica de esta ambulancia los recoge
+          // `observarAmbulancia`, ya suscrita al canal de descubrimiento — apenas el servidor
+          // publique su ruta y su anuncio, aparece igual que cualquier otra.
         } catch (error) {
           if (!mountedRef.current || !sigueVigente()) return;
 
@@ -534,7 +429,7 @@ export function EmergencyMap({
             onRouteStateChange({ status: "error", message });
             onDestinationChange?.(null);
           }
-          console.error("No se pudo calcular la ruta al hospital más cercano:", error);
+          console.error("No se pudo arrancar la simulación de la ambulancia:", error);
         }
       });
     });
@@ -542,11 +437,19 @@ export function EmergencyMap({
     return () => {
       mountedRef.current = false;
       abortControllerRef.current?.abort();
+      // Cubre el desmontaje "normal" (ej. Fast Refresh en dev, o si este componente algún día
+      // se desmonta desde una navegación SPA) — el caso de recarga dura/cierre de pestaña ya lo
+      // cubrió `pagehide` arriba, no este cleanup.
+      window.removeEventListener("pagehide", detenerMisSimulaciones);
+      detenerMisSimulaciones();
+      misSimulaciones.clear();
       cancelarAnuncios();
+      cancelarDecisiones();
       detenerTodasLasInstancias();
       markerRef.current?.remove();
       map.remove();
       ambulanciasActivasChannel.release();
+      decisionesChannel.release();
       setLoadedMap(null);
     };
   }, [onEmergencyPointChange, onRouteStateChange, onDestinationChange]);
