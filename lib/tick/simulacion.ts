@@ -4,7 +4,7 @@ import { hospitalMasCercano } from "@/lib/hospital/hospitalMasCercano";
 import { HOSPITALES_SAN_BORJA_Y_COLINDANTES } from "@/lib/hospital/hospitalesSanBorjaYColindantes";
 import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBorjaYColindantes";
 import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
-import { obtenerCanalServidor } from "@/lib/portal/serverReader";
+import { esperarBackfillDe, obtenerCanalServidor } from "@/lib/portal/serverReader";
 import {
   ambulanciaChannelId,
   PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID,
@@ -37,9 +37,57 @@ interface SimulacionActiva {
 // sobrevive al HMR de Next.js en dev sin perder las simulaciones ya arrancadas.
 const cacheSimulaciones = globalThis as unknown as {
   __simulacionesActivas?: Map<string, SimulacionActiva>;
+  __huerfanasReconciliadas?: boolean;
 };
 if (!cacheSimulaciones.__simulacionesActivas) {
   cacheSimulaciones.__simulacionesActivas = new Map();
+}
+
+/**
+ * Reconciliación al arrancar (a pedido del usuario, tras notar markers "fantasma" en el mapa):
+ * `__simulacionesActivas` es un Map en memoria — un reinicio del proceso (frecuente en
+ * desarrollo, cada vez que se edita código y se reinicia `bun dev`) lo vacía sin avisarle a
+ * nadie. Cualquier ambulancia que estuviera corriendo en el proceso anterior queda "huérfana":
+ * anunciada en `ambulancias-activas`, nunca llegó (nadie la seguía moviendo) y nunca se publicó
+ * su detención (nadie llamó `detenerSimulacionServidor`). Como este proyecto es un solo proceso
+ * Next.js (ver CLAUDE.md, "One Next.js project, no separate service"), cualquier id anunciado
+ * que este proceso fresco no conoce en su `__simulacionesActivas` (que arranca vacío) está
+ * garantizado detenido — no hay otro proceso donde pudiera seguir viva. Se corre una única vez
+ * por vida del proceso (guardia `__huerfanasReconciliadas`), en el primer acceso a cualquier
+ * función de este módulo.
+ */
+async function reconciliarSimulacionesHuerfanas(): Promise<void> {
+  if (cacheSimulaciones.__huerfanasReconciliadas) return;
+  cacheSimulaciones.__huerfanasReconciliadas = true;
+
+  try {
+    const activasChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
+      PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
+    );
+    await esperarBackfillDe(PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID, activasChannel);
+
+    const detenidasChannel = await obtenerCanalServidor<AmbulanciaDetenidaPayload>(
+      PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID
+    );
+    await esperarBackfillDe(PORTAL_AMBULANCIAS_DETENIDAS_CHANNEL_ID, detenidasChannel);
+
+    const idsAnunciados = new Set(activasChannel.messages.map((m) => m.content.ambulanceId));
+    const idsYaDetenidos = new Set(detenidasChannel.messages.map((m) => m.content.ambulanceId));
+    const huerfanas = [...idsAnunciados].filter((id) => !idsYaDetenidos.has(id));
+
+    for (const ambulanceId of huerfanas) {
+      await detenidasChannel.send({ content: { ambulanceId } }).catch((error) => {
+        console.error(`No se pudo reconciliar la ambulancia huérfana ${ambulanceId}:`, error);
+      });
+    }
+    if (huerfanas.length > 0) {
+      console.log(
+        `Reconciliación al arrancar: ${huerfanas.length} ambulancia(s) huérfana(s) marcadas como detenidas.`
+      );
+    }
+  } catch (error) {
+    console.error("Error reconciliando ambulancias huérfanas al arrancar:", error);
+  }
 }
 
 /**
@@ -64,6 +112,8 @@ export async function iniciarSimulacionServidor(
   ambulanceId: string,
   origen: LngLat
 ): Promise<ResultadoIniciarSimulacion> {
+  await reconciliarSimulacionesHuerfanas();
+
   // Chequeado antes de gastar ninguna llamada real (Mapbox/LLM) — si ya está en el tope, ni
   // vale la pena calcular hospital/ruta.
   if (
@@ -160,6 +210,8 @@ export async function iniciarSimulacionServidor(
  * sola vía `arrived: true`, y no hay nada que avisar si el id nunca existió).
  */
 export async function detenerSimulacionServidor(ambulanceId: string): Promise<void> {
+  await reconciliarSimulacionesHuerfanas();
+
   const simulacion = cacheSimulaciones.__simulacionesActivas?.get(ambulanceId);
   if (!simulacion) return;
   simulacion.detener();

@@ -24,6 +24,7 @@ const apiKey: string = apiKeyEnv;
 const cachePortal = globalThis as unknown as {
   __portalServerReader?: Portal;
   __canalesServidor?: Map<string, ChannelHandle<unknown>>;
+  __canalesConBackfillListo?: Set<string>;
 };
 
 function obtenerPortalReader(): Portal {
@@ -86,6 +87,46 @@ export async function obtenerCanalServidor<M>(
 }
 
 /**
+ * Espera a que el backfill de historial de `channelId` termine de llegar — bug real descubierto
+ * en vivo (issue #12/#16, confirmado también del lado servidor): `status === "ready"` NO alcanza,
+ * el backfill llega en un evento *posterior* separado vía `subscribe()` (ver el fix equivalente
+ * en `EmergencyMap.tsx#esperarPrimerMensaje`, y la nota de CLAUDE.md). Sin esto, una lectura de
+ * `.messages` justo después de que el proceso arranca (primer acceso a un canal en frío) puede
+ * devolver una lista vacía aunque sí haya historial real.
+ *
+ * Cacheado por `channelId` (una sola espera por canal por vida del proceso): llamadas repetidas
+ * para el mismo canal ya cargado devuelven al instante, en vez de re-esperar cada vez — necesario
+ * porque `obtenerAccionesPreviasSemaforo` se llama una vez por semáforo por tick.
+ *
+ * Solo hace falta antes de leer `.messages` para algo que dependa de precisión — no hace falta
+ * si el canal se va a usar únicamente para publicar (`.send()`), donde no importa qué historial
+ * ya tenía.
+ */
+export async function esperarBackfillDe(
+  channelId: string,
+  canal: ChannelHandle<unknown>,
+  timeoutMs = 3000
+): Promise<void> {
+  if (!cachePortal.__canalesConBackfillListo) cachePortal.__canalesConBackfillListo = new Set();
+  if (cachePortal.__canalesConBackfillListo.has(channelId)) return;
+
+  await new Promise<void>((resolve) => {
+    let cancelar: () => void = () => {};
+    const temporizador = setTimeout(() => {
+      cancelar();
+      resolve();
+    }, timeoutMs);
+    cancelar = canal.subscribe(() => {
+      clearTimeout(temporizador);
+      cancelar();
+      resolve();
+    });
+  });
+
+  cachePortal.__canalesConBackfillListo.add(channelId);
+}
+
+/**
  * Acciones ya publicadas para `(semaforoId, ambulanceId)` en semaforos-ruta-1 — fuente de
  * verdad de intervenciones (ver CLAUDE.md). Issue #12/#14: filtra por ambos campos, no solo
  * `semaforoId` — resuelve el gap documentado desde ticket #7 (una decisión de un trayecto
@@ -102,6 +143,7 @@ export async function obtenerAccionesPreviasSemaforo(
   const canal = await obtenerCanalServidor<DecisionSemaforoPublicada>(PORTAL_SEMAFOROS_CHANNEL_ID, {
     history: 500,
   });
+  await esperarBackfillDe(PORTAL_SEMAFOROS_CHANNEL_ID, canal);
   return canal.messages
     .filter(
       (mensaje) =>

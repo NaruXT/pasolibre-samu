@@ -318,7 +318,12 @@ export function EmergencyMap({
 
       const ruta = await esperarPrimerMensaje(routeChannel);
 
-      if (!mountedRef.current || !ruta) {
+      // Re-chequeado acá, no solo al principio: mientras se esperaba la ruta (puede tardar
+      // segundos), pudo llegar un aviso de detención para este mismo id — sin este segundo
+      // chequeo, `procesarDetenciones` ya habría corrido y encontrado "nada que remover"
+      // (esta instancia ni existía todavía en `ambulanceInstancesRef`), y esta función seguiría
+      // de largo creando un marker para una ambulancia que ya sabemos detenida.
+      if (!mountedRef.current || !ruta || idsDetenidosRef.current.has(ambulanceId)) {
         routeChannel.release();
         ambulanceChannel.release();
         idsConocidosRef.current.delete(ambulanceId);
