@@ -55,8 +55,13 @@ if (!cacheSimulaciones.__simulacionesActivas) {
  * garantizado detenido — no hay otro proceso donde pudiera seguir viva. Se corre una única vez
  * por vida del proceso (guardia `__huerfanasReconciliadas`), en el primer acceso a cualquier
  * función de este módulo.
+ *
+ * Exportada (issue #20/#21) — `lib/tick/flota.ts` la llama también en su primer acceso, porque
+ * opera sobre los canales Portal compartidos (`ambulancias-activas`/`ambulancias-detenidas`),
+ * no sobre `__simulacionesActivas`: cubre por igual a las simulaciones de viaje de este módulo
+ * y a las unidades de flota de `flota.ts`, sin necesitar una copia separada de esta lógica.
  */
-async function reconciliarSimulacionesHuerfanas(): Promise<void> {
+export async function reconciliarSimulacionesHuerfanas(): Promise<void> {
   if (cacheSimulaciones.__huerfanasReconciliadas) return;
   cacheSimulaciones.__huerfanasReconciliadas = true;
 
@@ -159,11 +164,13 @@ export async function iniciarSimulacionServidor(
   });
 
   // Anuncio de descubrimiento (issue #12/#15) — sin esto, ningún watcher (mapa principal,
-  // /ambulance-watch) puede enterarse de que esta ambulancia existe.
+  // /ambulance-watch) puede enterarse de que esta ambulancia existe. `tipo: "viaje"` (issue
+  // #20/#22) distingue esto de una unidad de flota (`lib/tick/flota.ts`) — el cliente lo usa
+  // para no ofrecer "Fin de turno" en un viaje efímero, que no tiene ese concepto.
   const registroChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
     PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
   );
-  await registroChannel.send({ content: { ambulanceId } });
+  await registroChannel.send({ content: { ambulanceId, tipo: "viaje" } });
 
   const ambulanceChannel = await obtenerCanalServidor<AmbulancePositionPayload>(
     ambulanciaChannelId(ambulanceId)

@@ -22,6 +22,7 @@ import type {
   RoutePublishPayload,
 } from "@/lib/portal/messages";
 import { SemaforosCorredor } from "@/components/SemaforosCorredor";
+import { COLOR_TITULO_POPUP, COLOR_TEXTO_POPUP } from "@/components/Semaforo";
 import { SEMAFOROS_SAN_BORJA_Y_COLINDANTES } from "@/lib/semaforo/semaforosSanBorjaYColindantes";
 import { semaforosEnRuta, type SemaforoEnRuta } from "@/lib/semaforo/semaforosEnRuta";
 import { HOSPITALES_SAN_BORJA_Y_COLINDANTES } from "@/lib/hospital/hospitalesSanBorjaYColindantes";
@@ -53,6 +54,57 @@ function createAmbulanceElement(): HTMLDivElement {
   el.style.fontSize = "24px";
   el.style.lineHeight = "1";
   return el;
+}
+
+/**
+ * Popup de "Fin de turno" (issue #20/#22) — solo se adjunta a unidades de flota (`tipo:
+ * "flota"`), nunca a un viaje efímero (`simulacion.ts`), que no tiene concepto de "libre" para
+ * retirar. `onFinDeTurno` dispara el DELETE y deshabilita el botón mientras está en vuelo — el
+ * marker lo remueve `procesarDetenciones` cuando llega el aviso por `ambulancias-detenidas`
+ * (mismo mecanismo ya usado para el resto de retiros), no este código.
+ */
+function crearPopupFinDeTurno(onFinDeTurno: () => Promise<void>): HTMLElement {
+  const contenedor = document.createElement("div");
+  contenedor.style.maxWidth = "180px";
+  contenedor.style.fontSize = "13px";
+  contenedor.style.lineHeight = "1.4";
+
+  const titulo = document.createElement("div");
+  titulo.style.fontWeight = "600";
+  titulo.style.marginBottom = "4px";
+  titulo.style.color = COLOR_TITULO_POPUP;
+  titulo.textContent = "🚑 Unidad de flota";
+  contenedor.appendChild(titulo);
+
+  const texto = document.createElement("div");
+  texto.style.marginBottom = "8px";
+  texto.style.color = COLOR_TEXTO_POPUP;
+  texto.textContent = "Unidad libre, patrullando.";
+  contenedor.appendChild(texto);
+
+  const boton = document.createElement("button");
+  boton.type = "button";
+  boton.textContent = "Fin de turno";
+  boton.style.cursor = "pointer";
+  boton.style.border = "none";
+  boton.style.borderRadius = "4px";
+  boton.style.padding = "4px 8px";
+  boton.style.fontSize = "12px";
+  boton.style.fontWeight = "600";
+  boton.style.color = "white";
+  boton.style.backgroundColor = "#dc2626";
+  boton.addEventListener("click", () => {
+    boton.disabled = true;
+    boton.textContent = "Retirando…";
+    void onFinDeTurno().catch((error) => {
+      console.error("No se pudo dar de baja la unidad:", error);
+      boton.disabled = false;
+      boton.textContent = "Fin de turno";
+    });
+  });
+  contenedor.appendChild(boton);
+
+  return contenedor;
 }
 
 export interface EmergencyPoint {
@@ -301,7 +353,10 @@ export function EmergencyMap({
     // observa lo que llegue por sus canales. Arrancar una simulación es un `fetch` a
     // `/api/ambulance/[id]/simulate` (ver el click handler más abajo); una vez que el servidor
     // publica la ruta + el anuncio, esta misma función la recoge igual que a cualquier otra.
-    const observarAmbulancia = async (ambulanceId: string) => {
+    const observarAmbulancia = async (
+      ambulanceId: string,
+      tipo: AmbulanciaActivaPayload["tipo"]
+    ) => {
       if (idsConocidosRef.current.has(ambulanceId) || idsDetenidosRef.current.has(ambulanceId)) {
         return;
       }
@@ -338,6 +393,20 @@ export function EmergencyMap({
         .setLngLat([ruta.origin.lng, ruta.origin.lat])
         .addTo(map);
 
+      // Issue #20/#22: solo una unidad de flota ofrece "Fin de turno" — un viaje efímero
+      // (`tipo: "viaje"`) no tiene concepto de "libre" para retirar.
+      if (tipo === "flota") {
+        const popup = new mapboxgl.Popup({ offset: 14 }).setDOMContent(
+          crearPopupFinDeTurno(async () => {
+            const response = await fetch(`/api/fleet/${ambulanceId}/enroll`, { method: "DELETE" });
+            if (!response.ok) {
+              throw new Error(`No se pudo dar de baja la unidad (${response.status}).`);
+            }
+          })
+        );
+        marker.setPopup(popup);
+      }
+
       const fuente: PosicionSource = new RealPosicionSource(ambulanceChannel);
       const detenerFuente = fuente.suscribir((posicion) => {
         marker.setLngLat([posicion.lng, posicion.lat]);
@@ -370,7 +439,7 @@ export function EmergencyMap({
     const procesarAnunciosDeRegistro = () => {
       if (!mountedRef.current) return;
       for (const msg of ambulanciasActivasChannel.messages) {
-        void observarAmbulancia(msg.content.ambulanceId);
+        void observarAmbulancia(msg.content.ambulanceId, msg.content.tipo);
       }
     };
     const cancelarAnuncios = ambulanciasActivasChannel.subscribe(procesarAnunciosDeRegistro);
@@ -448,12 +517,15 @@ export function EmergencyMap({
         const sigueVigente = () => esAgregar || requestId === requestIdRef.current;
 
         try {
-          // Post-slice #16: el cliente ya no calcula hospital/ruta ni simula nada — le pide al
-          // servidor que arranque (o reinicie) la simulación de esta ambulancia. El servidor
-          // hace exactamente lo que antes hacía este click handler (hospital más cercano por
-          // ruta real, sin excluir por especialidad) y además la mueve, sin depender de que
-          // esta pestaña siga abierta — mismo mecanismo que una ambulancia GPS real.
-          const response = await fetch(`/api/ambulance/${ambulanceId}/simulate`, {
+          // Issue #20/#21: "Agregar ambulancia" ya no arranca un viaje — da de alta una unidad
+          // de flota que patrulla libre, sin destino, hasta que una llamada de emergencia futura
+          // (slice 3/3, todavía no implementado) la asigne. El flujo default sigue exactamente
+          // igual que antes (post-slice #16: el servidor calcula hospital/ruta y mueve la
+          // ambulancia sin depender de que esta pestaña siga abierta).
+          const endpoint = esAgregar
+            ? `/api/fleet/${ambulanceId}/enroll`
+            : `/api/ambulance/${ambulanceId}/simulate`;
+          const response = await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ lat, lng }),
@@ -463,14 +535,21 @@ export function EmergencyMap({
             // El body trae el mensaje real (ej. "Ya hay 8 ambulancias simuladas activas...", 429)
             // — mostrar solo el status code sería mucho menos útil que decir por qué falló.
             const cuerpo = await response.json().catch(() => null);
-            throw new Error(cuerpo?.error ?? `No se pudo arrancar la simulación (${response.status}).`);
+            const mensajeGenerico = esAgregar
+              ? `No se pudo dar de alta la unidad (${response.status}).`
+              : `No se pudo arrancar la simulación (${response.status}).`;
+            throw new Error(cuerpo?.error ?? mensajeGenerico);
           }
-          const data: ResultadoIniciarSimulacion = await response.json();
           if (!mountedRef.current || !sigueVigente()) return;
 
-          misSimulaciones.add(ambulanceId);
-
-          if (!esAgregar) {
+          if (esAgregar) {
+            // Una unidad de flota dada de alta no es responsabilidad de esta pestaña — a
+            // diferencia de un viaje simulado (`misSimulaciones`), patrulla indefinidamente sin
+            // gastar LLM/TomTom y solo se retira con "Fin de turno" (slice 2/3), no al resetear
+            // el mapa ni al cerrar la pestaña que la creó.
+          } else {
+            const data: ResultadoIniciarSimulacion = await response.json();
+            misSimulaciones.add(ambulanceId);
             onDestinationChange?.(data.destino);
             // El flujo default dibuja la línea "de tráfico" (perfil driving-traffic, la que ve
             // el usuario); con ambulancias agregadas, cada una publica su propia ruta a Portal
@@ -485,15 +564,15 @@ export function EmergencyMap({
           if (!mountedRef.current || !sigueVigente()) return;
 
           const message = error instanceof Error ? error.message : String(error);
-          // El error (ej. tope de 8 simuladas alcanzado) es igual de relevante en modo
-          // "agregar" — solo lo que afecta específicamente al flujo default (la línea/destino
-          // ya mostrados) queda condicionado a `!esAgregar`.
+          // El error (ej. tope alcanzado, de flota o de simulaciones) es igual de relevante en
+          // modo "agregar" — solo lo que afecta específicamente al flujo default (la línea/
+          // destino ya mostrados) queda condicionado a `!esAgregar`.
           onRouteStateChange({ status: "error", message });
           if (!esAgregar) {
             routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
             onDestinationChange?.(null);
           }
-          console.error("No se pudo arrancar la simulación de la ambulancia:", error);
+          console.error("No se pudo completar la acción sobre la ambulancia:", error);
         }
       });
     });
