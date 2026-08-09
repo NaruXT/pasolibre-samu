@@ -40,6 +40,18 @@ if (!cacheSimulaciones.__simulacionesActivas) {
   cacheSimulaciones.__simulacionesActivas = new Map();
 }
 
+/**
+ * Tope a pedido del usuario — solo cuenta simuladas (`__simulacionesActivas`), no ambulancias
+ * GPS reales (esas tienen su propio cache en `app/api/ambulance/[id]/position/route.ts`, sin
+ * tope). Una simulación sale de este Map en cuanto llega a destino (ver el callback de
+ * `iniciarSimulacionServidor` más abajo), así que el conteo siempre refleja las que siguen en
+ * ruta, no un total histórico.
+ */
+export const MAX_SIMULACIONES_ACTIVAS = 8;
+
+/** Distinguible del resto de errores (Mapbox/Portal caídos, etc.) para que la ruta HTTP devuelva 429, no 502. */
+export class LimiteSimulacionesAlcanzadoError extends Error {}
+
 export interface ResultadoIniciarSimulacion {
   destino: LngLat & { nombre: string };
   /** Perfil "driving-traffic" — la línea/ETA que se muestra en el mapa, no el ritmo propio de la ambulancia. */
@@ -50,6 +62,17 @@ export async function iniciarSimulacionServidor(
   ambulanceId: string,
   origen: LngLat
 ): Promise<ResultadoIniciarSimulacion> {
+  // Chequeado antes de gastar ninguna llamada real (Mapbox/LLM) — si ya está en el tope, ni
+  // vale la pena calcular hospital/ruta.
+  if (
+    !cacheSimulaciones.__simulacionesActivas!.has(ambulanceId) &&
+    cacheSimulaciones.__simulacionesActivas!.size >= MAX_SIMULACIONES_ACTIVAS
+  ) {
+    throw new LimiteSimulacionesAlcanzadoError(
+      `Ya hay ${MAX_SIMULACIONES_ACTIVAS} ambulancias simuladas activas (el máximo) — esperá a que alguna llegue a destino antes de agregar otra.`
+    );
+  }
+
   // Mismo flujo que un click simulado (issue #12/#13): hospital más cercano por ruta real, sin
   // excluir ninguno por especialidad. La ruta "driving" que gana esta comparación es
   // directamente el ritmo propio de la ambulancia — no hace falta pedirla de nuevo.

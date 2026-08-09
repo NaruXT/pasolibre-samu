@@ -51,6 +51,13 @@ function crearElementoSemaforo(): { contenedor: HTMLDivElement; badge: HTMLDivEl
   return { contenedor, badge };
 }
 
+// El popup de mapbox-gl siempre tiene fondo blanco, sin importar el tema del sistema — pero sin
+// un color de texto explícito, este contenido hereda el `color` de `body` (app/globals.css), que
+// en modo oscuro es #ededed (casi blanco). Texto casi blanco sobre fondo blanco = ilegible (bug
+// real reportado por el usuario, con screenshot). Colores fijos acá, independientes del tema.
+const COLOR_TITULO_POPUP = "#111827";
+const COLOR_TEXTO_POPUP = "#374151";
+
 /** Contenido del popup vía DOM (no `setHTML`): la `explicacion` viene del LLM y no es texto de confianza. */
 function crearContenidoPopup(decision: DecisionSemaforo): HTMLElement {
   const { icono, etiqueta } = INFO_ACCION[decision.accion];
@@ -63,10 +70,12 @@ function crearContenidoPopup(decision: DecisionSemaforo): HTMLElement {
   const titulo = document.createElement("div");
   titulo.style.fontWeight = "600";
   titulo.style.marginBottom = "4px";
+  titulo.style.color = COLOR_TITULO_POPUP;
   titulo.textContent = `${icono} ${etiqueta}`;
   contenedor.appendChild(titulo);
 
   const texto = document.createElement("div");
+  texto.style.color = COLOR_TEXTO_POPUP;
   texto.textContent = decision.explicacion;
   contenedor.appendChild(texto);
 

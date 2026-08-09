@@ -403,7 +403,12 @@ export function EmergencyMap({
             body: JSON.stringify({ lat, lng }),
             signal: fetchOptions.signal,
           });
-          if (!response.ok) throw new Error(`No se pudo arrancar la simulación (${response.status}).`);
+          if (!response.ok) {
+            // El body trae el mensaje real (ej. "Ya hay 8 ambulancias simuladas activas...", 429)
+            // — mostrar solo el status code sería mucho menos útil que decir por qué falló.
+            const cuerpo = await response.json().catch(() => null);
+            throw new Error(cuerpo?.error ?? `No se pudo arrancar la simulación (${response.status}).`);
+          }
           const data: ResultadoIniciarSimulacion = await response.json();
           if (!mountedRef.current || !sigueVigente()) return;
 
@@ -424,9 +429,12 @@ export function EmergencyMap({
           if (!mountedRef.current || !sigueVigente()) return;
 
           const message = error instanceof Error ? error.message : String(error);
+          // El error (ej. tope de 8 simuladas alcanzado) es igual de relevante en modo
+          // "agregar" — solo lo que afecta específicamente al flujo default (la línea/destino
+          // ya mostrados) queda condicionado a `!esAgregar`.
+          onRouteStateChange({ status: "error", message });
           if (!esAgregar) {
             routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
-            onRouteStateChange({ status: "error", message });
             onDestinationChange?.(null);
           }
           console.error("No se pudo arrancar la simulación de la ambulancia:", error);

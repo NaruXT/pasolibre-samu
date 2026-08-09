@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { detenerSimulacionServidor, iniciarSimulacionServidor } from "@/lib/tick/simulacion";
+import {
+  detenerSimulacionServidor,
+  iniciarSimulacionServidor,
+  LimiteSimulacionesAlcanzadoError,
+} from "@/lib/tick/simulacion";
 
 /** Arranca (o reinicia) una ambulancia simulada del lado servidor — ver lib/tick/simulacion.ts. */
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -19,6 +23,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const resultado = await iniciarSimulacionServidor(ambulanceId, { lng: body.lng, lat: body.lat });
     return NextResponse.json({ ok: true, ambulanceId, ...resultado });
   } catch (error) {
+    if (error instanceof LimiteSimulacionesAlcanzadoError) {
+      return NextResponse.json({ error: error.message }, { status: 429 });
+    }
     console.error("Error iniciando simulación de ambulancia:", error);
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },

@@ -31,7 +31,10 @@ export default function Home() {
             ? `Emergencia en ${emergencyPoint.lat.toFixed(5)}, ${emergencyPoint.lng.toFixed(5)}`
             : "Click en el mapa para marcar el punto de emergencia."}
         </p>
-        {emergencyPoint && (
+        {/* No condicionado a `emergencyPoint`: un error del flujo "Agregar ambulancia" (ej.
+            tope de simuladas activas) puede pasar sin que nunca haya habido un click default,
+            y sigue siendo relevante mostrarlo. */}
+        {routeState.status !== "idle" && (
           <p className="text-sm text-zinc-500">{routeStatusText(routeState, hospitalDestino)}</p>
         )}
       </header>
