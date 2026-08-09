@@ -9,8 +9,12 @@ export interface DecisionSemaforo {
 
 /**
  * Forma publicada a semaforos-ruta-1 — issue #12/#14: `ambulanceId` scopea "ya decidido" por
- * trayecto, no solo por semáforo (gap documentado desde ticket #7, ver CLAUDE.md).
+ * ambulancia. Issue #20/#23: `tramoId` scopea además por LLAMADA atendida, no por la vida
+ * entera de la unidad — necesario desde que una unidad de flota reutiliza el mismo
+ * `ambulanceId` en cada llamada que atiende (a diferencia de un viaje efímero, donde
+ * `ambulanceId` ya era fresco por trayecto). Ver `orquestarTick`/`OrquestarTickInput.tramoId`.
  */
 export interface DecisionSemaforoPublicada extends DecisionSemaforo {
   ambulanceId: string;
+  tramoId: string;
 }

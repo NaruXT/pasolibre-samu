@@ -127,15 +127,18 @@ export async function esperarBackfillDe(
 }
 
 /**
- * Acciones ya publicadas para `(semaforoId, ambulanceId)` en semaforos-ruta-1 — fuente de
- * verdad de intervenciones (ver CLAUDE.md). Issue #12/#14: filtra por ambos campos, no solo
+ * Acciones ya publicadas para `(semaforoId, tramoId)` en semaforos-ruta-1 — fuente de verdad
+ * de intervenciones (ver CLAUDE.md). Issue #12/#14: filtra por ambos campos, no solo
  * `semaforoId` — resuelve el gap documentado desde ticket #7 (una decisión de un trayecto
  * anterior, o de otra ambulancia activa a la vez, ya no bloquea una decisión nueva para el
- * mismo semáforo en un trayecto distinto).
+ * mismo semáforo en un trayecto distinto). Issue #20/#23: el segundo campo es `tramoId`, no
+ * `ambulanceId` — una unidad de flota reutiliza el mismo `ambulanceId` en cada llamada que
+ * atiende de por vida, así que escopar por `ambulanceId` habría suprimido en silencio la
+ * decisión de una llamada posterior que vuelve a cruzar un semáforo ya decidido antes.
  */
 export async function obtenerAccionesPreviasSemaforo(
   semaforoId: string,
-  ambulanceId: string
+  tramoId: string
 ): Promise<AccionSemaforo[]> {
   // history: 500 es un tope generoso para el puñado de semáforos de este proyecto, pero es
   // un tope: decisiones más allá de los últimos 500 mensajes del canal dejarían de contar
@@ -145,9 +148,6 @@ export async function obtenerAccionesPreviasSemaforo(
   });
   await esperarBackfillDe(PORTAL_SEMAFOROS_CHANNEL_ID, canal);
   return canal.messages
-    .filter(
-      (mensaje) =>
-        mensaje.content.semaforoId === semaforoId && mensaje.content.ambulanceId === ambulanceId
-    )
+    .filter((mensaje) => mensaje.content.semaforoId === semaforoId && mensaje.content.tramoId === tramoId)
     .map((mensaje) => mensaje.content.accion);
 }

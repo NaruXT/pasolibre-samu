@@ -19,6 +19,15 @@ export interface PosicionAmbulancia extends LngLat {
 export interface OrquestarTickInput {
   /** Identidad de trayecto (issue #12/#14) — scopea "ya decidido" por ambulancia, no solo por semáforo. */
   ambulanceId: string;
+  /**
+   * Issue #20/#23: scopea "ya decidido" por LLAMADA atendida, no por la vida entera de la
+   * ambulancia — default `ambulanceId` si se omite (comportamiento sin cambios para viajes
+   * efímeros y GPS real, donde `ambulanceId` ya es fresco por trayecto). Una unidad de flota
+   * pasa un `tramoId` explícito (uno por llamada, compartido por sus dos tramos) porque
+   * reutiliza el mismo `ambulanceId` en cada llamada que atiende — sin esto, la segunda vez
+   * que cruza un semáforo ya decidido en una llamada anterior se saltaría la decisión.
+   */
+  tramoId?: string;
   posicionAmbulancia: PosicionAmbulancia;
   semaforosPendientes: SemaforoPendiente[];
 }
@@ -35,7 +44,7 @@ export interface OrquestarTickDeps {
    * Fronteras de I/O real — en producción hablan con Portal/el LLM, en tests son dobles en
    * memoria. Escopadas por `(semaforoId, ambulanceId)`, no solo `semaforoId` (issue #12/#14).
    */
-  obtenerAccionesPrevias: (semaforoId: string, ambulanceId: string) => Promise<AccionSemaforo[]>;
+  obtenerAccionesPrevias: (semaforoId: string, tramoId: string) => Promise<AccionSemaforo[]>;
   publicarDecision: (decision: DecisionSemaforoPublicada) => Promise<void>;
   /** Agente de decisión (LLM real en producción, ticket #8) — inyectado para no gastar cuota en tests. */
   decidirAccion: (contexto: ContextoDecisionSemaforo) => Promise<DecisionSemaforo>;
@@ -73,6 +82,7 @@ export async function orquestarTick(
   deps: OrquestarTickDeps
 ): Promise<ResultadoSemaforo[]> {
   const ahora = (deps.ahoraSegundos ?? (() => Date.now() / 1000))();
+  const tramoId = input.tramoId ?? input.ambulanceId;
   const resultados: ResultadoSemaforo[] = [];
 
   for (const semaforo of input.semaforosPendientes) {
@@ -82,7 +92,7 @@ export async function orquestarTick(
       input.posicionAmbulancia.velocidadMetrosPorSegundo
     );
 
-    const accionesPrevias = await deps.obtenerAccionesPrevias(semaforo.semaforoId, input.ambulanceId);
+    const accionesPrevias = await deps.obtenerAccionesPrevias(semaforo.semaforoId, tramoId);
     const yaTieneDecision = accionesPrevias.length > 0;
 
     let decision: DecisionSemaforo | null = null;
@@ -96,7 +106,7 @@ export async function orquestarTick(
         congestionTransversal,
         ambulanceId: input.ambulanceId,
       });
-      await deps.publicarDecision({ ...decision, ambulanceId: input.ambulanceId });
+      await deps.publicarDecision({ ...decision, ambulanceId: input.ambulanceId, tramoId });
       accionesPrevias.push(decision.accion);
     }
 

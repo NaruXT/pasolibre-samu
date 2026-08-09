@@ -130,6 +130,11 @@ interface AmbulanceInstance {
   // simulación en sí (`InterpoladaPosicionSource`) corre del lado servidor (`lib/tick/simulacion.ts`)
   // sin importar si la ambulancia es simulada o GPS real. `detenerFuente` cancela la suscripción.
   detenerFuente: () => void;
+  // Issue #20/#23: cancela la suscripción persistente a `routeChannel` (ver `observarAmbulancia`)
+  // que mantiene `semaforosPendientes` al día cuando una unidad de flota despachada publica una
+  // ruta nueva en cada tramo (recogida → hospital → patrullaje) — un viaje efímero solo publica
+  // una ruta en su vida, así que para ese caso esta suscripción nunca vuelve a dispararse.
+  cancelarRuta: () => void;
 }
 
 interface EmergencyMapProps {
@@ -168,8 +173,12 @@ export function EmergencyMap({
   // siempre (cada tick real gasta cuota del LLM).
   const misSimulacionesRef = useRef<Set<string>>(new Set());
   const modoAgregarRef = useRef(false);
+  // Issue #20/#23: "Llamada de emergencia" arma, igual que "Agregar ambulancia", un modo de un
+  // solo click — mutuamente excluyente con ese (armar uno desarma el otro).
+  const modoLlamadaRef = useRef(false);
   const mountedRef = useRef(true);
   const [modoAgregarActivo, setModoAgregarActivo] = useState(false);
+  const [modoLlamadaActivo, setModoLlamadaActivo] = useState(false);
   const [loadedMap, setLoadedMap] = useState<mapboxgl.Map | null>(null);
   // El dataset fijo (ticket #9) tiene cientos de semáforos reales en 7 distritos — mostrarlos
   // todos a la vez (invariante original del ticket #6, pensada para 1 semáforo de prueba) satura
@@ -287,6 +296,7 @@ export function EmergencyMap({
       const instancia = ambulanceInstancesRef.current.get(id);
       if (!instancia) return;
       instancia.detenerFuente();
+      instancia.cancelarRuta();
       instancia.marker.remove();
       instancia.routeChannel.release();
       instancia.ambulanceChannel.release();
@@ -393,6 +403,23 @@ export function EmergencyMap({
         .setLngLat([ruta.origin.lng, ruta.origin.lat])
         .addTo(map);
 
+      // Issue #20/#23: una unidad de flota despachada publica una ruta NUEVA en cada transición
+      // de tramo (patrullaje → recogida → hospital → patrullaje) al mismo `routeChannel` — sin
+      // esto, `semaforosPendientes` (y por lo tanto los semáforos mostrados en el mapa)
+      // quedarían congelados en el corredor de la ruta que estaba vigente cuando se observó la
+      // ambulancia por primera vez. `subscribe()` solo dispara para mensajes FUTUROS (no
+      // re-dispara para el ya consumido por `esperarPrimerMensaje` arriba), así que no hay
+      // recómputo redundante en el caso común de un viaje efímero (una sola ruta en su vida).
+      const actualizarRutaYSemaforos = () => {
+        const ultimaRuta = routeChannel.messages[routeChannel.messages.length - 1]?.content;
+        if (!ultimaRuta || !mountedRef.current) return;
+        const instancia = ambulanceInstancesRef.current.get(ambulanceId);
+        if (!instancia) return;
+        instancia.semaforosPendientes = semaforosEnRuta(SEMAFOROS_SAN_BORJA_Y_COLINDANTES, ultimaRuta.geometry);
+        recalcularSemaforosVisibles();
+      };
+      const cancelarRuta = routeChannel.subscribe(actualizarRutaYSemaforos);
+
       // Issue #20/#22: solo una unidad de flota ofrece "Fin de turno" — un viaje efímero
       // (`tipo: "viaje"`) no tiene concepto de "libre" para retirar.
       if (tipo === "flota") {
@@ -412,7 +439,10 @@ export function EmergencyMap({
         marker.setLngLat([posicion.lng, posicion.lat]);
         // A pedido del usuario: al llegar, se ve un momento en el destino y después se quita
         // sola — si no, queda congelada en el mapa para siempre (nadie más la remueve).
-        if (posicion.arrived) {
+        // Issue #20/#23: condicionado a `tipo !== "flota"` — una unidad de flota reporta
+        // `arrived: true` al final de CADA tramo (recogida, luego hospital), no solo al
+        // terminar de verdad; solo un viaje efímero tiene un `arrived` terminal de verdad.
+        if (posicion.arrived && tipo !== "flota") {
           setTimeout(() => {
             if (!mountedRef.current) return;
             detenerInstancia(ambulanceId);
@@ -428,6 +458,7 @@ export function EmergencyMap({
         routeChannel,
         ambulanceChannel,
         detenerFuente,
+        cancelarRuta,
       });
       recalcularSemaforosVisibles();
     };
@@ -480,8 +511,40 @@ export function EmergencyMap({
         // antes (resetea todo — "nueva emergencia"). Con el modo armado (un solo click, se
         // desarma acá mismo), en cambio suma una instancia sin tocar las existentes.
         const esAgregar = modoAgregarRef.current;
+        // Issue #20/#23: "Llamada de emergencia" arma un tercer modo, mutuamente excluyente con
+        // "Agregar ambulancia" (ver los botones más abajo, que ya se encargan de que solo uno
+        // esté armado a la vez).
+        const esLlamada = modoLlamadaRef.current;
         modoAgregarRef.current = false;
+        modoLlamadaRef.current = false;
         setModoAgregarActivo(false);
+        setModoLlamadaActivo(false);
+
+        if (esLlamada) {
+          // No toca el mapa ni las instancias existentes — solo reporta la urgencia. El
+          // servidor decide qué unidad la atiende (`asignarLlamadaEmergencia`); su marker/ruta
+          // los recoge `observarAmbulancia`, ya suscrita al canal de descubrimiento de esa
+          // unidad desde que fue dada de alta.
+          try {
+            const response = await fetch("/api/fleet/dispatch", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ lat, lng }),
+            });
+            if (!response.ok) {
+              const cuerpo = await response.json().catch(() => null);
+              throw new Error(cuerpo?.error ?? `No se pudo asignar una unidad (${response.status}).`);
+            }
+          } catch (error) {
+            if (!mountedRef.current) return;
+            const message = error instanceof Error ? error.message : String(error);
+            // Mismo canal de error genérico que usa el flujo "Agregar ambulancia" (ver
+            // `app/page.tsx`: deliberadamente no condicionado a que exista un `emergencyPoint`).
+            onRouteStateChange({ status: "error", message });
+            console.error("No se pudo asignar una unidad a la llamada de emergencia:", error);
+          }
+          return;
+        }
 
         const ambulanceId = crypto.randomUUID();
         const routeSource = () =>
@@ -611,17 +674,36 @@ export function EmergencyMap({
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
       {loadedMap && (
-        <button
-          type="button"
-          onClick={() => {
-            modoAgregarRef.current = true;
-            setModoAgregarActivo(true);
-          }}
-          disabled={modoAgregarActivo}
-          className="absolute left-4 top-4 z-10 rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow disabled:cursor-default disabled:opacity-80 dark:bg-zinc-800 dark:text-zinc-100"
-        >
-          {modoAgregarActivo ? "Click en el mapa para agregar…" : "Agregar ambulancia"}
-        </button>
+        <div className="absolute left-4 top-4 z-10 flex gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              modoAgregarRef.current = true;
+              modoLlamadaRef.current = false;
+              setModoAgregarActivo(true);
+              setModoLlamadaActivo(false);
+            }}
+            disabled={modoAgregarActivo}
+            className="rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow disabled:cursor-default disabled:opacity-80 dark:bg-zinc-800 dark:text-zinc-100"
+          >
+            {modoAgregarActivo ? "Click en el mapa para agregar…" : "Agregar ambulancia"}
+          </button>
+          {/* Issue #20/#23: asigna la unidad de flota libre más cercana (por ruta real) al punto
+              clickeado — ver `asignarLlamadaEmergencia` en `lib/tick/flota.ts`. */}
+          <button
+            type="button"
+            onClick={() => {
+              modoLlamadaRef.current = true;
+              modoAgregarRef.current = false;
+              setModoLlamadaActivo(true);
+              setModoAgregarActivo(false);
+            }}
+            disabled={modoLlamadaActivo}
+            className="rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow disabled:cursor-default disabled:opacity-80 dark:bg-zinc-800 dark:text-zinc-100"
+          >
+            {modoLlamadaActivo ? "Click en el mapa para la llamada…" : "Llamada de emergencia"}
+          </button>
+        </div>
       )}
       {loadedMap && (
         <SemaforosCorredor

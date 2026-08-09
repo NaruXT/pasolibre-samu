@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { darDeAltaUnidadFlota, detenerUnidadFlota, LimiteFlotaAlcanzadaError } from "@/lib/tick/flota";
+import {
+  darDeAltaUnidadFlota,
+  detenerUnidadFlota,
+  LimiteFlotaAlcanzadaError,
+  UnidadEnProcesoError,
+} from "@/lib/tick/flota";
 
 /** Da de alta una unidad de flota en `{lat, lng}` — patrulla libre, sin viaje asignado. Ver lib/tick/flota.ts. */
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -38,6 +43,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
  * botón — encontrado en code-review, un 200 falso dejaría al usuario creyendo que la unidad se
  * retiró cuando en realidad `detenerUnidadFlota` falló (ver su comentario sobre por qué el
  * publish va antes de tocar el cache, para que este error sea seguro de reintentar).
+ *
+ * Issue #20/#23: `UnidadEnProcesoError` (unidad atendiendo una llamada, R3) → 409, mismo
+ * patrón que el 429 de `LimiteFlotaAlcanzadaError` en el POST — distinguible del 502 genérico
+ * para que el mensaje real ("está atendiendo una llamada...") llegue al usuario.
  */
 export async function DELETE(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id: ambulanceId } = await params;
@@ -45,6 +54,9 @@ export async function DELETE(_request: Request, { params }: { params: Promise<{ 
     await detenerUnidadFlota(ambulanceId);
     return NextResponse.json({ ok: true });
   } catch (error) {
+    if (error instanceof UnidadEnProcesoError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
     console.error(`Error dando de baja la unidad de flota ${ambulanceId}:`, error);
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },

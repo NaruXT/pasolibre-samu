@@ -10,12 +10,13 @@ const DECISION_FAKE: Omit<DecisionSemaforo, "semaforoId"> = {
 const AMBULANCE_ID = "amb-1";
 const OTRA_AMBULANCE_ID = "amb-2";
 
-// Claves "semaforoId:ambulanceId" — imita cómo `serverReader.ts` escopa por ambos campos.
+// Claves "semaforoId:tramoId" — imita cómo `serverReader.ts` escopa por ambos campos (issue
+// #20/#23: tramoId, no ambulanceId — ver `orquestarTick`).
 function crearDepsFake(accionesPreviasPorClave: Record<string, AccionSemaforo[]> = {}) {
   const decisionesPublicadas: DecisionSemaforoPublicada[] = [];
   const deps: OrquestarTickDeps = {
-    obtenerAccionesPrevias: async (semaforoId, ambulanceId) =>
-      accionesPreviasPorClave[`${semaforoId}:${ambulanceId}`] ?? [],
+    obtenerAccionesPrevias: async (semaforoId, tramoId) =>
+      accionesPreviasPorClave[`${semaforoId}:${tramoId}`] ?? [],
     publicarDecision: async (decision) => {
       decisionesPublicadas.push(decision);
     },
@@ -64,7 +65,9 @@ describe("orquestarTick", () => {
 
     const decisionEsperada: DecisionSemaforo = { semaforoId: "sem-cerca", ...DECISION_FAKE };
     expect(resultados[0]?.decision).toEqual(decisionEsperada);
-    expect(decisionesPublicadas).toEqual([{ ...decisionEsperada, ambulanceId: AMBULANCE_ID }]);
+    expect(decisionesPublicadas).toEqual([
+      { ...decisionEsperada, ambulanceId: AMBULANCE_ID, tramoId: AMBULANCE_ID },
+    ]);
   });
 
   test("semáforo dentro de la ventana con decisión ya publicada: no reinvoca", async () => {
@@ -101,8 +104,48 @@ describe("orquestarTick", () => {
 
     expect(resultados[0]?.decision).not.toBeNull();
     expect(decisionesPublicadas).toEqual([
-      { semaforoId: "sem-cerca", ...DECISION_FAKE, ambulanceId: OTRA_AMBULANCE_ID },
+      { semaforoId: "sem-cerca", ...DECISION_FAKE, ambulanceId: OTRA_AMBULANCE_ID, tramoId: OTRA_AMBULANCE_ID },
     ]);
+  });
+
+  test("issue #20/#23: mismo ambulanceId, tramoId distinto (unidad de flota en su 2da llamada) — no se suprime la decisión", async () => {
+    const { deps, decisionesPublicadas } = crearDepsFake({
+      // Decisión ya publicada para este semáforo en un tramo anterior de la MISMA ambulancia.
+      "sem-cerca:tramo-1": ["mantener_ciclo"],
+    });
+
+    const resultados = await orquestarTick(
+      {
+        ambulanceId: AMBULANCE_ID,
+        tramoId: "tramo-2",
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
+      deps
+    );
+
+    expect(resultados[0]?.decision).not.toBeNull();
+    expect(decisionesPublicadas).toEqual([
+      { semaforoId: "sem-cerca", ...DECISION_FAKE, ambulanceId: AMBULANCE_ID, tramoId: "tramo-2" },
+    ]);
+  });
+
+  test("issue #20/#23: sin tramoId explícito, default es ambulanceId — comportamiento sin cambios para viajes efímeros/GPS real", async () => {
+    const { deps, decisionesPublicadas } = crearDepsFake({
+      "sem-cerca:amb-1": ["mantener_ciclo"],
+    });
+
+    const resultados = await orquestarTick(
+      {
+        ambulanceId: AMBULANCE_ID,
+        posicionAmbulancia: AMBULANCIA_CERCA,
+        semaforosPendientes: [SEMAFORO_CERCA],
+      },
+      deps
+    );
+
+    expect(resultados[0]?.decision).toBeNull();
+    expect(decisionesPublicadas).toHaveLength(0);
   });
 
   test("reconstruye la fase efectiva a partir de una decisión previa de anticipar_verde", async () => {

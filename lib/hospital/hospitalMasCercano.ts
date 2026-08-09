@@ -1,6 +1,6 @@
-import { distance } from "@turf/distance";
 import type { DrivingRoute, LngLat } from "@/lib/mapbox/directions";
 import type { HospitalFijo } from "./hospitalesSanBorjaYColindantes";
+import { distanciaHaversineMetros } from "@/lib/geo/haversine";
 
 /** Cuántos candidatos por línea recta se llevan a ruta real — evita pedirle a Mapbox los 20. */
 const PRESELECCION_TOP_K = 5;
@@ -69,8 +69,4 @@ export async function hospitalMasCercano(
     lat: mejor.hospital.lat,
     ruta: mejor.ruta,
   };
-}
-
-function distanciaHaversineMetros(a: LngLat, b: LngLat): number {
-  return distance([a.lng, a.lat], [b.lng, b.lat], { units: "meters" });
 }

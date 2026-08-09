@@ -11,7 +11,7 @@ import path from "node:path";
  */
 const LOG_PATH = path.join(process.cwd(), ".data", "llm-cost-log.jsonl");
 
-export type OrigenLlamadaTick = "simulacion" | "gps-real" | "api-tick-legacy";
+export type OrigenLlamadaTick = "simulacion" | "gps-real" | "api-tick-legacy" | "flota";
 
 export interface RegistroLlamadaLLM {
   timestamp: string;
