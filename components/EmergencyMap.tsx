@@ -241,6 +241,15 @@ export function EmergencyMap({
   const [modoAgregarActivo, setModoAgregarActivo] = useState(false);
   const [modoLlamadaActivo, setModoLlamadaActivo] = useState(false);
   const [loadedMap, setLoadedMap] = useState<mapboxgl.Map | null>(null);
+  // Feedback pedido por el usuario ("demora en la interacción, sobre todo en la llamada de
+  // emergencia"): antes, el click en el mapa que dispara el fetch a `/api/fleet/dispatch` o
+  // `/api/fleet/[id]/enroll` no dejaba ningún rastro visual mientras la respuesta estaba en
+  // vuelo (el modo ya se había desarmado, los botones volvían a verse "normales") — un click
+  // real puede tardar 1-2s (llamada) o varios segundos (alta, ver CLAUDE.md), y sin esto parece
+  // que no pasó nada, invitando a un segundo click. No confundir con `modoAgregarActivo`/
+  // `modoLlamadaActivo`, que representan el modo "armado" antes del click, no la request en
+  // vuelo después de él.
+  const [accionEnCurso, setAccionEnCurso] = useState<"agregar" | "llamada" | null>(null);
   // El dataset fijo (ticket #9) tiene cientos de semáforos reales en 7 distritos — mostrarlos
   // todos a la vez (invariante original del ticket #6, pensada para 1 semáforo de prueba) satura
   // el mapa y el navegador (~1000 markers + ~1000 setInterval). Por eso solo se renderiza la
@@ -702,6 +711,7 @@ export function EmergencyMap({
           // servidor decide qué unidad la atiende (`asignarLlamadaEmergencia`); su marker/ruta
           // los recoge `observarAmbulancia`, ya suscrita al canal de descubrimiento de esa
           // unidad desde que fue dada de alta.
+          setAccionEnCurso("llamada");
           try {
             const response = await fetch("/api/fleet/dispatch", {
               method: "POST",
@@ -724,6 +734,8 @@ export function EmergencyMap({
             // que además ya se muestra en el header vía `onRouteStateChange`. Un overlay
             // bloqueante para un caso de negocio normal (no un bug) es peor UX que no loguear.
             console.warn("No se pudo asignar una unidad a la llamada de emergencia:", error);
+          } finally {
+            if (mountedRef.current) setAccionEnCurso(null);
           }
           return;
         }
@@ -737,6 +749,7 @@ export function EmergencyMap({
         if (!esAgregar) return;
 
         const ambulanceId = crypto.randomUUID();
+        setAccionEnCurso("agregar");
         try {
           const response = await fetch(`/api/fleet/${ambulanceId}/enroll`, {
             method: "POST",
@@ -762,6 +775,8 @@ export function EmergencyMap({
           // incluso para resultados esperados y ya manejados (ej. tope de flota alcanzado, 429),
           // que ya se muestran en el header vía `onRouteStateChange`.
           console.warn("No se pudo dar de alta la unidad:", error);
+        } finally {
+          if (mountedRef.current) setAccionEnCurso(null);
         }
       });
     });
@@ -798,6 +813,20 @@ export function EmergencyMap({
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+      {/* Pedido por el usuario: antes, mientras Mapbox cargaba estilo/tiles (el intervalo entre
+          el mount de este componente y el evento "load" que arma `loadedMap`), no había ningún
+          rastro visual — ni botones, ni indicador — así que el mapa parecía trabado. Los botones
+          solo existen una vez que `loadedMap` está listo (sus handlers dependen de `map`, ya
+          capturada en el closure del `useEffect`); esta tuerca ocupa ese mismo hueco mientras
+          tanto, en vez de dejarlo en blanco. */}
+      {!loadedMap && (
+        <div className="absolute left-4 top-4 z-10 flex items-center gap-2 rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow dark:bg-zinc-800 dark:text-zinc-100">
+          <span className="inline-block animate-spin" aria-hidden="true">
+            ⚙️
+          </span>
+          Cargando mapa…
+        </div>
+      )}
       {loadedMap && (
         <div className="absolute left-4 top-4 z-10 flex gap-2">
           <button
@@ -808,10 +837,21 @@ export function EmergencyMap({
               setModoAgregarActivo(true);
               setModoLlamadaActivo(false);
             }}
-            disabled={modoAgregarActivo}
+            disabled={modoAgregarActivo || accionEnCurso !== null}
             className="rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow disabled:cursor-default disabled:opacity-80 dark:bg-zinc-800 dark:text-zinc-100"
           >
-            {modoAgregarActivo ? "Click en el mapa para agregar…" : "Agregar ambulancia"}
+            {accionEnCurso === "agregar" ? (
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block animate-spin" aria-hidden="true">
+                  ⚙️
+                </span>
+                Agregando…
+              </span>
+            ) : modoAgregarActivo ? (
+              "Click en el mapa para agregar…"
+            ) : (
+              "Agregar ambulancia"
+            )}
           </button>
           {/* Issue #20/#23: asigna la unidad de flota libre más cercana (por ruta real) al punto
               clickeado — ver `asignarLlamadaEmergencia` en `lib/tick/flota.ts`. */}
@@ -823,10 +863,21 @@ export function EmergencyMap({
               setModoLlamadaActivo(true);
               setModoAgregarActivo(false);
             }}
-            disabled={modoLlamadaActivo}
+            disabled={modoLlamadaActivo || accionEnCurso !== null}
             className="rounded-md bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow disabled:cursor-default disabled:opacity-80 dark:bg-zinc-800 dark:text-zinc-100"
           >
-            {modoLlamadaActivo ? "Click en el mapa para la llamada…" : "Llamada de emergencia"}
+            {accionEnCurso === "llamada" ? (
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block animate-spin" aria-hidden="true">
+                  ⚙️
+                </span>
+                Asignando…
+              </span>
+            ) : modoLlamadaActivo ? (
+              "Click en el mapa para la llamada…"
+            ) : (
+              "Llamada de emergencia"
+            )}
           </button>
         </div>
       )}

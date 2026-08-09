@@ -374,7 +374,34 @@ export async function asignarLlamadaEmergencia(puntoLlamada: LngLat): Promise<{ 
   )!.posicionActual;
 
   const tramoId = crypto.randomUUID();
-  await iniciarTramoRecogida(ganador.ambulanceId, tramoId, origenGanador, puntoLlamada, ganador.ruta);
+
+  // Optimización (reportada por el usuario: "Llamada de emergencia" se sentía lenta): antes esto
+  // se esperaba (`await`) antes de responder al cliente, sumando una vuelta completa a Portal
+  // (`publicarRuta` + adquirir el canal de posición) a la latencia percibida del click, encima de
+  // las 3 llamadas reales a Mapbox de `unidadLibreMasCercana` de arriba. El cliente no necesita
+  // esa confirmación para saber que el despacho tuvo éxito — ya está suscrito en vivo al
+  // `routeChannel` de esta unidad desde que fue dada de alta (`observarAmbulancia`), así que el
+  // marker/línea de ruta se actualizan solos apenas `iniciarTramoRecogida` publique. Se corre en
+  // segundo plano, no en el camino de respuesta del HTTP.
+  //
+  // A diferencia de `darDeAltaUnidadFlota` (donde el cliente SÍ depende de la respuesta HTTP para
+  // enterarse de que la unidad existe, no hay ninguna suscripción previa), acá el ganador ya
+  // estaba siendo observado desde su alta — diferir esta parte no oculta ningún fallo que el
+  // usuario necesite ver en el momento del click, salvo el propio `iniciarTramo`, que si falla
+  // deja la unidad reservada (`en_proceso`) sin ruta ni timers para siempre. Por eso el fallback a
+  // `iniciarPatrullaje` (mismo patrón que el catch de `onLlegada` en `iniciarTramo`) es
+  // obligatorio acá, no opcional.
+  void iniciarTramoRecogida(ganador.ambulanceId, tramoId, origenGanador, puntoLlamada, ganador.ruta).catch(
+    (error) => {
+      console.error(`Error arrancando el tramo de recogida de ${ganador.ambulanceId}:`, error);
+      void iniciarPatrullaje(ganador.ambulanceId, origenGanador).catch((error2) => {
+        console.error(
+          `No se pudo recuperar la unidad ${ganador.ambulanceId} a patrullaje tras un fallo arrancando su tramo:`,
+          error2
+        );
+      });
+    }
+  );
 
   return { ambulanceId: ganador.ambulanceId };
 }
