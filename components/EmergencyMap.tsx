@@ -443,17 +443,55 @@ export function EmergencyMap({
     // servidor (`lib/portal/serverReader.ts`): espera al primer `subscribe()` de detenidas (o un
     // timeout corto) antes de arrancar el procesamiento de anuncios, para que la gran mayoría de
     // los ids ya-muertos se filtren por el chequeo de `idsDetenidosRef` sin abrir ningún canal.
-    const esperarBackfillListo = (canal: ChannelHandle<unknown>, timeoutMs = 2000): Promise<void> => {
+    //
+    // Bug real encontrado en vivo (2026-08-09, sesión de "limpiar el mapa" tras una reconciliación
+    // masiva que marcó ~100 unidades como detenidas de una sola vez): esta función resolvía en el
+    // PRIMER evento `subscribe()`, pero ese primer evento puede ser el disparado por `status ===
+    // "ready"` (backfill todavía vacío) — el backfill real llega en un evento *posterior y
+    // separado* (mismo hallazgo ya documentado para `esperarPrimerMensaje` más abajo y para
+    // `esperarBackfillDe` del lado servidor). Con pocos ids muertos el race rara vez importaba
+    // visualmente; con ~100 marcados de golpe, quedaban ~14 markers fantasma en el mapa de forma
+    // reproducible en cada carga de página, sin autocorregirse nunca (confirmado esperando 30s+).
+    // Mismo fix que `esperarPrimerMensaje`: debounce hasta que `.messages` deje de crecer, no solo
+    // "llegó el primer evento".
+    const esperarBackfillListo = (
+      canal: ChannelHandle<unknown>,
+      timeoutMs = 6000,
+      debounceMs = 500
+    ): Promise<void> => {
       return new Promise((resolve) => {
+        let resuelto = false;
         let cancelar: () => void = () => {};
-        const temporizador = setTimeout(() => {
+        let temporizadorSettle: ReturnType<typeof setTimeout> | null = null;
+        let ultimoLen = canal.messages.length;
+
+        const finalizar = () => {
+          if (resuelto) return;
+          resuelto = true;
+          clearTimeout(temporizadorTimeout);
+          if (temporizadorSettle) clearTimeout(temporizadorSettle);
           cancelar();
           resolve();
-        }, timeoutMs);
+        };
+
+        const temporizadorTimeout = setTimeout(finalizar, timeoutMs);
+
+        const programarSettle = () => {
+          if (temporizadorSettle) clearTimeout(temporizadorSettle);
+          temporizadorSettle = setTimeout(finalizar, debounceMs);
+        };
+
+        // Solo arranca el settle si ya hay algo — si `canal.messages` sigue vacío, confiar en el
+        // timeout total de arriba (armar el settle incondicionalmente, como en el primer intento
+        // de este fix, resolvía "estable en 0" apenas pasaban `debounceMs` sin que el backfill
+        // siquiera hubiera empezado a llegar — confirmado en vivo con un log temporal: los 100
+        // markers fantasma se crearon con `detenidasChannelMessages: 0` cada vez).
+        if (ultimoLen > 0) programarSettle();
         cancelar = canal.subscribe(() => {
-          clearTimeout(temporizador);
-          cancelar();
-          resolve();
+          if (canal.messages.length !== ultimoLen) {
+            ultimoLen = canal.messages.length;
+            programarSettle();
+          }
         });
       });
     };
