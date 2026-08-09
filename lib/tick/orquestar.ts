@@ -3,6 +3,7 @@ import type { AccionSemaforo, DecisionSemaforo, DecisionSemaforoPublicada } from
 import type { ContextoDecisionSemaforo } from "./agent";
 import { faseEfectiva } from "@/lib/semaforo/faseEfectiva";
 import type { FaseSemaforo } from "@/lib/semaforo/fase";
+import { semaforosVecinos } from "@/lib/semaforo/semaforosVecinos";
 import type { CongestionTransversal } from "@/lib/tomtom/trafficFlow";
 
 /** Ventana de decisión propuesta por el ticket #7: ~60s antes de que la ambulancia llegue. */
@@ -67,6 +68,11 @@ export interface OrquestarTickDeps {
  * una decide independientemente — lo que sí sigue siendo cierto es que un único marcador en el
  * mapa no puede mostrar dos decisiones distintas a la vez para la misma ubicación física (ver
  * `components/EmergencyMap.tsx`); eso es un límite de la UI, no de esta función.
+ *
+ * Salvaguarda de intersección (ver `forzarRojoEnVecinos`): forzar verde a un semáforo también
+ * fuerza rojo a cualquier otro semáforo geográficamente vecino (misma intersección física) que
+ * todavía no tenga su propia decisión — sin esto, dos accesos de la misma intersección podían
+ * quedar en verde a la vez y dejar pasar tránsito transversal justo cuando pasa la ambulancia.
  */
 export async function orquestarTick(
   input: OrquestarTickInput,
@@ -98,6 +104,10 @@ export async function orquestarTick(
       });
       await deps.publicarDecision({ ...decision, ambulanceId: input.ambulanceId });
       accionesPrevias.push(decision.accion);
+
+      if (decision.accion === "anticipar_verde" || decision.accion === "extender_verde") {
+        await forzarRojoEnVecinos(semaforo, input.semaforosPendientes, input.ambulanceId, deps);
+      }
     }
 
     resultados.push({
@@ -109,4 +119,39 @@ export async function orquestarTick(
   }
 
   return resultados;
+}
+
+/**
+ * Salvaguarda de intersección: cuando `semaforo` se acaba de forzar a verde para la ambulancia,
+ * cualquier otro semáforo de `semaforosPendientes` a metros de distancia (misma intersección
+ * física, ver `semaforosVecinos`) se fuerza a rojo — sin invocar al LLM, es una regla mecánica,
+ * no una decisión de tráfico. No pisa un vecino que ya tenga cualquier decisión propia publicada
+ * (incluida una `forzar_rojo_cruce` anterior de otro semáforo de la misma intersección): eso
+ * respeta "una sola decisión por semáforo por trayecto" (ver el bucle de arriba) y, en particular,
+ * nunca sobrescribe una decisión directa legítima (el vecino podría estar en el propio trayecto
+ * de la ambulancia, no ser tránsito transversal — el dataset no distingue dirección, ver
+ * `semaforosVecinos`) con una protección de cruce.
+ */
+async function forzarRojoEnVecinos(
+  semaforo: SemaforoPendiente,
+  semaforosPendientes: readonly SemaforoPendiente[],
+  ambulanceId: string,
+  deps: Pick<OrquestarTickDeps, "obtenerAccionesPrevias" | "publicarDecision">
+): Promise<void> {
+  const vecinos = semaforosVecinos(semaforo, semaforosPendientes);
+
+  for (const vecino of vecinos) {
+    const accionesVecino = await deps.obtenerAccionesPrevias(vecino.semaforoId, ambulanceId);
+    if (accionesVecino.length > 0) continue;
+
+    await deps.publicarDecision({
+      semaforoId: vecino.semaforoId,
+      accion: "forzar_rojo_cruce",
+      explicacion:
+        `El semáforo ${semaforo.semaforoId}, de la misma intersección, se abrió en verde ` +
+        "para la ambulancia — este se mantiene en rojo para que el tránsito transversal no se " +
+        "cruce en su camino.",
+      ambulanceId,
+    });
+  }
 }

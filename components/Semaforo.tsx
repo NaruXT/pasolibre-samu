@@ -15,6 +15,7 @@ const INFO_ACCION: Record<AccionSemaforo, { icono: string; etiqueta: string; col
   anticipar_verde: { icono: "⏩", etiqueta: "Verde anticipado", color: "#2563eb" },
   extender_verde: { icono: "⏳", etiqueta: "Verde extendido", color: "#7c3aed" },
   mantener_ciclo: { icono: "➖", etiqueta: "Sin intervención", color: "#64748b" },
+  forzar_rojo_cruce: { icono: "🛑", etiqueta: "Rojo por cruce", color: "#dc2626" },
 };
 
 function crearElementoSemaforo(): { contenedor: HTMLDivElement; badge: HTMLDivElement } {
