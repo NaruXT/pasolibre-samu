@@ -448,12 +448,15 @@ export function EmergencyMap({
         const sigueVigente = () => esAgregar || requestId === requestIdRef.current;
 
         try {
-          // Post-slice #16: el cliente ya no calcula hospital/ruta ni simula nada — le pide al
-          // servidor que arranque (o reinicie) la simulación de esta ambulancia. El servidor
-          // hace exactamente lo que antes hacía este click handler (hospital más cercano por
-          // ruta real, sin excluir por especialidad) y además la mueve, sin depender de que
-          // esta pestaña siga abierta — mismo mecanismo que una ambulancia GPS real.
-          const response = await fetch(`/api/ambulance/${ambulanceId}/simulate`, {
+          // Issue #20/#21: "Agregar ambulancia" ya no arranca un viaje — da de alta una unidad
+          // de flota que patrulla libre, sin destino, hasta que una llamada de emergencia futura
+          // (slice 3/3, todavía no implementado) la asigne. El flujo default sigue exactamente
+          // igual que antes (post-slice #16: el servidor calcula hospital/ruta y mueve la
+          // ambulancia sin depender de que esta pestaña siga abierta).
+          const endpoint = esAgregar
+            ? `/api/fleet/${ambulanceId}/enroll`
+            : `/api/ambulance/${ambulanceId}/simulate`;
+          const response = await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ lat, lng }),
@@ -463,14 +466,21 @@ export function EmergencyMap({
             // El body trae el mensaje real (ej. "Ya hay 8 ambulancias simuladas activas...", 429)
             // — mostrar solo el status code sería mucho menos útil que decir por qué falló.
             const cuerpo = await response.json().catch(() => null);
-            throw new Error(cuerpo?.error ?? `No se pudo arrancar la simulación (${response.status}).`);
+            const mensajeGenerico = esAgregar
+              ? `No se pudo dar de alta la unidad (${response.status}).`
+              : `No se pudo arrancar la simulación (${response.status}).`;
+            throw new Error(cuerpo?.error ?? mensajeGenerico);
           }
-          const data: ResultadoIniciarSimulacion = await response.json();
           if (!mountedRef.current || !sigueVigente()) return;
 
-          misSimulaciones.add(ambulanceId);
-
-          if (!esAgregar) {
+          if (esAgregar) {
+            // Una unidad de flota dada de alta no es responsabilidad de esta pestaña — a
+            // diferencia de un viaje simulado (`misSimulaciones`), patrulla indefinidamente sin
+            // gastar LLM/TomTom y solo se retira con "Fin de turno" (slice 2/3), no al resetear
+            // el mapa ni al cerrar la pestaña que la creó.
+          } else {
+            const data: ResultadoIniciarSimulacion = await response.json();
+            misSimulaciones.add(ambulanceId);
             onDestinationChange?.(data.destino);
             // El flujo default dibuja la línea "de tráfico" (perfil driving-traffic, la que ve
             // el usuario); con ambulancias agregadas, cada una publica su propia ruta a Portal
@@ -485,15 +495,15 @@ export function EmergencyMap({
           if (!mountedRef.current || !sigueVigente()) return;
 
           const message = error instanceof Error ? error.message : String(error);
-          // El error (ej. tope de 8 simuladas alcanzado) es igual de relevante en modo
-          // "agregar" — solo lo que afecta específicamente al flujo default (la línea/destino
-          // ya mostrados) queda condicionado a `!esAgregar`.
+          // El error (ej. tope alcanzado, de flota o de simulaciones) es igual de relevante en
+          // modo "agregar" — solo lo que afecta específicamente al flujo default (la línea/
+          // destino ya mostrados) queda condicionado a `!esAgregar`.
           onRouteStateChange({ status: "error", message });
           if (!esAgregar) {
             routeSource()?.setData(toRouteFeature(EMPTY_ROUTE_GEOMETRY));
             onDestinationChange?.(null);
           }
-          console.error("No se pudo arrancar la simulación de la ambulancia:", error);
+          console.error("No se pudo completar la acción sobre la ambulancia:", error);
         }
       });
     });

@@ -55,8 +55,13 @@ if (!cacheSimulaciones.__simulacionesActivas) {
  * garantizado detenido — no hay otro proceso donde pudiera seguir viva. Se corre una única vez
  * por vida del proceso (guardia `__huerfanasReconciliadas`), en el primer acceso a cualquier
  * función de este módulo.
+ *
+ * Exportada (issue #20/#21) — `lib/tick/flota.ts` la llama también en su primer acceso, porque
+ * opera sobre los canales Portal compartidos (`ambulancias-activas`/`ambulancias-detenidas`),
+ * no sobre `__simulacionesActivas`: cubre por igual a las simulaciones de viaje de este módulo
+ * y a las unidades de flota de `flota.ts`, sin necesitar una copia separada de esta lógica.
  */
-async function reconciliarSimulacionesHuerfanas(): Promise<void> {
+export async function reconciliarSimulacionesHuerfanas(): Promise<void> {
   if (cacheSimulaciones.__huerfanasReconciliadas) return;
   cacheSimulaciones.__huerfanasReconciliadas = true;
 

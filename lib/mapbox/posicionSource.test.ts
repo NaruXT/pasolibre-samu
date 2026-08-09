@@ -27,7 +27,7 @@ function esperar(ms: number): Promise<void> {
 
 describe("InterpoladaPosicionSource", () => {
   test("emite la posición inicial de forma síncrona, sin esperar el primer tick", () => {
-    const fuente = new InterpoladaPosicionSource(RUTA_CORTA, 10_000);
+    const fuente = new InterpoladaPosicionSource(RUTA_CORTA, { tickMs: 10_000 });
     const posiciones: AmbulancePosition[] = [];
 
     const detener = fuente.suscribir((posicion) => posiciones.push(posicion));
@@ -38,7 +38,7 @@ describe("InterpoladaPosicionSource", () => {
   });
 
   test("emite posiciones sucesivas por tick y deja de emitir tras llegar", async () => {
-    const fuente = new InterpoladaPosicionSource(RUTA_MUY_CORTA, 10);
+    const fuente = new InterpoladaPosicionSource(RUTA_MUY_CORTA, { tickMs: 10 });
     const posiciones: AmbulancePosition[] = [];
 
     const detener = fuente.suscribir((posicion) => posiciones.push(posicion));
@@ -54,7 +54,7 @@ describe("InterpoladaPosicionSource", () => {
   });
 
   test("detener() antes de llegar corta los ticks futuros", async () => {
-    const fuente = new InterpoladaPosicionSource(RUTA_CORTA, 10);
+    const fuente = new InterpoladaPosicionSource(RUTA_CORTA, { tickMs: 10 });
     const posiciones: AmbulancePosition[] = [];
 
     const detener = fuente.suscribir((posicion) => posiciones.push(posicion));
@@ -63,6 +63,35 @@ describe("InterpoladaPosicionSource", () => {
 
     await esperar(50);
     expect(posiciones).toHaveLength(cantidadAlDetener);
+  });
+
+  // Issue #20/#21: patrullaje de una unidad de flota libre — recorre la misma ruta ida y
+  // vuelta indefinidamente en vez de terminar al llegar al extremo.
+  test("con loop:true, sigue emitiendo después de pasar el extremo de la ruta, sin reportar arrived", async () => {
+    const fuente = new InterpoladaPosicionSource(RUTA_MUY_CORTA, { tickMs: 10, loop: true });
+    const posiciones: AmbulancePosition[] = [];
+
+    const detener = fuente.suscribir((posicion) => posiciones.push(posicion));
+    await esperar(80); // de sobra para pasar los ~3 ticks que agotarían una ruta no-loop
+
+    detener();
+    expect(posiciones.length).toBeGreaterThan(3);
+    expect(posiciones.every((p) => p.arrived === false)).toBe(true);
+  });
+
+  test("con loop:true, rebota: avanza hasta el extremo y vuelve por la misma ruta", async () => {
+    const fuente = new InterpoladaPosicionSource(RUTA_MUY_CORTA, { tickMs: 10, loop: true });
+    const lngs: number[] = [];
+
+    const detener = fuente.suscribir((posicion) => lngs.push(posicion.lng));
+    await esperar(80);
+    detener();
+
+    const maxLng = Math.max(...lngs);
+    const indiceMax = lngs.indexOf(maxLng);
+    expect(indiceMax).toBeGreaterThan(0); // no arrancó ya en el extremo
+    expect(indiceMax).toBeLessThan(lngs.length - 1); // hay puntos después del extremo (volviendo)
+    expect(lngs[lngs.length - 1]).toBeLessThan(maxLng); // el último punto ya viene de vuelta
   });
 });
 

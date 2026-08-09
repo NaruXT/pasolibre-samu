@@ -20,6 +20,18 @@ export interface PosicionSource {
   suscribir(onPosicion: (posicion: AmbulancePosition) => void): () => void;
 }
 
+export interface InterpoladaPosicionSourceOptions {
+  tickMs?: number;
+  /**
+   * Patrullaje de una unidad de flota libre (issue #20/#21): en vez de terminar al llegar al
+   * extremo de la ruta, rebota y la recorre de vuelta, indefinidamente — nunca reporta
+   * `arrived: true`. Si lo hiciera, `EmergencyMap.tsx#observarAmbulancia` interpretaría el
+   * primer extremo del loop como una llegada real y removería el marker a los 4s, aunque la
+   * unidad sigue patrullando.
+   */
+  loop?: boolean;
+}
+
 /**
  * Simulada (tickets #4/#6-#9) — avanza el tiempo con un timer local propio y reusa
  * `ambulancePositionAt` (pura). Emite la primera posición de forma síncrona al suscribirse,
@@ -27,26 +39,46 @@ export interface PosicionSource {
  * abstracción.
  */
 export class InterpoladaPosicionSource implements PosicionSource {
+  private readonly tickMs: number;
+  private readonly loop: boolean;
+
   constructor(
     private readonly route: DrivingRoute,
-    private readonly tickMs: number = TICK_MS_DEFAULT
-  ) {}
+    options: InterpoladaPosicionSourceOptions = {}
+  ) {
+    this.tickMs = options.tickMs ?? TICK_MS_DEFAULT;
+    this.loop = options.loop ?? false;
+  }
 
   suscribir(onPosicion: (posicion: AmbulancePosition) => void): () => void {
     let elapsedSeconds = 0;
+    let direccion: 1 | -1 = 1;
     let timer: ReturnType<typeof setInterval> | null = null;
 
     const emitir = (): AmbulancePosition => {
       const posicion = ambulancePositionAt(this.route, elapsedSeconds);
-      onPosicion(posicion);
-      return posicion;
+      const posicionFinal = this.loop ? { ...posicion, arrived: false } : posicion;
+      onPosicion(posicionFinal);
+      return posicionFinal;
     };
 
-    if (!emitir().arrived) {
+    const avanzar = () => {
+      elapsedSeconds += direccion * (this.tickMs / 1000);
+      if (elapsedSeconds >= this.route.durationSeconds) {
+        elapsedSeconds = this.route.durationSeconds;
+        direccion = -1;
+      } else if (elapsedSeconds <= 0) {
+        elapsedSeconds = 0;
+        direccion = 1;
+      }
+    };
+
+    const primeraPosicion = emitir();
+    if (this.loop || !primeraPosicion.arrived) {
       timer = setInterval(() => {
-        elapsedSeconds += this.tickMs / 1000;
+        avanzar();
         const posicion = emitir();
-        if (posicion.arrived && timer !== null) {
+        if (!this.loop && posicion.arrived && timer !== null) {
           clearInterval(timer);
           timer = null;
         }
