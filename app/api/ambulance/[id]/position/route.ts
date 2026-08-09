@@ -67,11 +67,13 @@ async function resolverPrimeraPosicion(
   });
 
   // Anuncio de descubrimiento (issue #12/#15) — sin esto, ningún watcher (mapa principal,
-  // /ambulance-watch) puede enterarse de que esta ambulancia existe.
+  // /ambulance-watch) puede enterarse de que esta ambulancia existe. `tipo: "viaje"` (issue
+  // #20/#22): una ambulancia GPS real se autoasigna un destino al prenderse, sin pasar por
+  // flota (A9, fuera de alcance) — no tiene concepto de "libre" para ofrecer "Fin de turno".
   const registroChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
     PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
   );
-  await registroChannel.send({ content: { ambulanceId } });
+  await registroChannel.send({ content: { ambulanceId, tipo: "viaje" } });
 
   return { destino, semaforosPendientes, ultimaPosicion: null };
 }

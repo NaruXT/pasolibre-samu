@@ -164,11 +164,13 @@ export async function iniciarSimulacionServidor(
   });
 
   // Anuncio de descubrimiento (issue #12/#15) — sin esto, ningún watcher (mapa principal,
-  // /ambulance-watch) puede enterarse de que esta ambulancia existe.
+  // /ambulance-watch) puede enterarse de que esta ambulancia existe. `tipo: "viaje"` (issue
+  // #20/#22) distingue esto de una unidad de flota (`lib/tick/flota.ts`) — el cliente lo usa
+  // para no ofrecer "Fin de turno" en un viaje efímero, que no tiene ese concepto.
   const registroChannel = await obtenerCanalServidor<AmbulanciaActivaPayload>(
     PORTAL_AMBULANCIAS_ACTIVAS_CHANNEL_ID
   );
-  await registroChannel.send({ content: { ambulanceId } });
+  await registroChannel.send({ content: { ambulanceId, tipo: "viaje" } });
 
   const ambulanceChannel = await obtenerCanalServidor<AmbulancePositionPayload>(
     ambulanciaChannelId(ambulanceId)

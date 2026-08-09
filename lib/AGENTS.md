@@ -17,7 +17,7 @@ Toda la lógica de dominio y los I/O boundaries del proyecto (orquestación de t
 
 - `lib/tick/orquestar.ts#orquestarTick` — único seam que arma ETA → fase → TomTom → LLM → publish. Invocado desde `app/api/tick` y desde `app/api/ambulance/[id]/position`.
 - `lib/tick/simulacion.ts#iniciarSimulacionServidor` / `detenerSimulacionServidor` — ciclo de vida completo de una ambulancia simulada (arranca en `app/api/ambulance/[id]/simulate`).
-- `lib/tick/flota.ts#darDeAltaUnidadFlota` — da de alta una unidad de flota que patrulla libre, sin viaje (arranca en `app/api/fleet/[id]/enroll`). Nunca llama a `orquestarTick`.
+- `lib/tick/flota.ts#darDeAltaUnidadFlota` / `detenerUnidadFlota` — alta y baja ("Fin de turno") de una unidad de flota que patrulla libre, sin viaje (ambas en `app/api/fleet/[id]/enroll`, POST/DELETE). El alta nunca llama a `orquestarTick`.
 - `lib/portal/serverReader.ts#obtenerCanalServidor` — único punto para adquirir un canal Portal del lado servidor (cacheado por `channelId`, singleton de vida larga).
 
 ## Contratos e invariantes

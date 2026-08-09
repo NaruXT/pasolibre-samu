@@ -55,8 +55,10 @@ function crearElementoSemaforo(): { contenedor: HTMLDivElement; badge: HTMLDivEl
 // un color de texto explícito, este contenido hereda el `color` de `body` (app/globals.css), que
 // en modo oscuro es #ededed (casi blanco). Texto casi blanco sobre fondo blanco = ilegible (bug
 // real reportado por el usuario, con screenshot). Colores fijos acá, independientes del tema.
-const COLOR_TITULO_POPUP = "#111827";
-const COLOR_TEXTO_POPUP = "#374151";
+// Exportados (issue #20/#22) — `EmergencyMap.tsx` los reusa para el popup de "Fin de turno" en
+// vez de redescubrir el mismo bug con un popup distinto.
+export const COLOR_TITULO_POPUP = "#111827";
+export const COLOR_TEXTO_POPUP = "#374151";
 
 /** Contenido del popup vía DOM (no `setHTML`): la `explicacion` viene del LLM y no es texto de confianza. */
 function crearContenidoPopup(decision: DecisionSemaforo): HTMLElement {
