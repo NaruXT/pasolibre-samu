@@ -116,7 +116,7 @@ export async function orquestarTick(
       accionesPrevias.push(decision.accion);
 
       if (decision.accion === "anticipar_verde" || decision.accion === "extender_verde") {
-        await forzarRojoEnVecinos(semaforo, input.semaforosPendientes, input.ambulanceId, deps);
+        await forzarRojoEnVecinos(semaforo, input.semaforosPendientes, input.ambulanceId, tramoId, deps);
       }
     }
 
@@ -141,17 +141,24 @@ export async function orquestarTick(
  * nunca sobrescribe una decisión directa legítima (el vecino podría estar en el propio trayecto
  * de la ambulancia, no ser tránsito transversal — el dataset no distingue dirección, ver
  * `semaforosVecinos`) con una protección de cruce.
+ *
+ * Issue #20/#23 (resuelto en el merge con la protección de cruce): escopado por `tramoId`, no
+ * `ambulanceId` — igual que el resto de `orquestarTick`, para que una unidad de flota que ya
+ * forzó rojo en un vecino durante una llamada anterior no quede bloqueada de volver a hacerlo en
+ * una llamada nueva por el mismo semáforo físico. `ambulanceId` se sigue publicando en el
+ * registro (igual que la decisión principal) — es solo el campo de audit, no el de scoping.
  */
 async function forzarRojoEnVecinos(
   semaforo: SemaforoPendiente,
   semaforosPendientes: readonly SemaforoPendiente[],
   ambulanceId: string,
+  tramoId: string,
   deps: Pick<OrquestarTickDeps, "obtenerAccionesPrevias" | "publicarDecision">
 ): Promise<void> {
   const vecinos = semaforosVecinos(semaforo, semaforosPendientes);
 
   for (const vecino of vecinos) {
-    const accionesVecino = await deps.obtenerAccionesPrevias(vecino.semaforoId, ambulanceId);
+    const accionesVecino = await deps.obtenerAccionesPrevias(vecino.semaforoId, tramoId);
     if (accionesVecino.length > 0) continue;
 
     await deps.publicarDecision({
@@ -162,6 +169,7 @@ async function forzarRojoEnVecinos(
         "para la ambulancia — este se mantiene en rojo para que el tránsito transversal no se " +
         "cruce en su camino.",
       ambulanceId,
+      tramoId,
     });
   }
 }
