@@ -165,6 +165,17 @@ export async function darDeAltaUnidadFlota(ambulanceId: string, origen: LngLat):
   });
 
   try {
+    // Bug real encontrado en vivo post-#23: la ruta se calcula primero y SOLO DESPUÉS se
+    // publica el anuncio de descubrimiento — no al revés. `iniciarPatrullaje` hace un fetch
+    // real a Mapbox (puede tardar varios segundos); el cliente (`observarAmbulancia`) reacciona
+    // al anuncio casi al instante y espera la ruta con un timeout fijo de 5s
+    // (`esperarPrimerMensaje`). Publicar el anuncio ANTES de que la ruta exista (como quedó tras
+    // el refactor de #23 para reusar `iniciarPatrullaje`) le da al cliente una carrera real que
+    // puede perder bajo latencia normal de Mapbox — pierde el timeout, nunca crea el marker, y
+    // la unidad queda huérfana del lado del cliente aunque el servidor la siga moviendo de
+    // verdad (confirmado en vivo: "No se encontró ruta publicada para la ambulancia ...").
+    await iniciarPatrullaje(ambulanceId, origen);
+
     // `history: 500` explícito — bug real encontrado post-#23 (13 ambulancias fantasma nunca
     // reconciliadas): el default del SDK sin esta opción es 50, y `obtenerCanalServidor` cachea
     // por channelId, así que cualquier acquisition sin esta opción que gane la carrera contra
@@ -174,8 +185,6 @@ export async function darDeAltaUnidadFlota(ambulanceId: string, origen: LngLat):
       { history: 500 }
     );
     await registroChannel.send({ content: { ambulanceId, tipo: "flota" } });
-
-    await iniciarPatrullaje(ambulanceId, origen);
   } catch (error) {
     cacheFlota.__flotaActiva!.delete(ambulanceId);
     throw error;
